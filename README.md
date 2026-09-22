@@ -99,8 +99,7 @@ a2~ design the authentication boundary, then return to my previous route
 ```
 
 Markers in the middle of an instruction are ordinary text. The router removes an exact recognized
-leading or trailing token before sending the instruction to the model. Legacy `#1`, `#2`, and `#3`
-remain aliases for Luna/medium, Sol/medium, and Astra/xhigh respectively.
+leading or trailing token before sending the instruction to the model.
 
 These markers bypass approval because they are explicit user authorization. Model switches
 requested by the agent through `self_router.request_model_switch` follow the configured
@@ -113,8 +112,8 @@ steering message.
 
 The default user configuration is `~/.config/codex-self-router/config.yaml`. It configures the
 agent-switch approval policy, model IDs, default and allowed efforts, directive prefixes and
-levels, legacy aliases, descriptions used by the routing policy, and the API-equivalent prices
-captured in new reports. See
+levels, descriptions used by the routing policy, and the API-equivalent prices captured in new
+reports. See
 `config.example.yaml`. Use a different file with the global option
 `--config /path/to/config.yaml`, before the subcommand. Create the defaults on another machine with:
 
