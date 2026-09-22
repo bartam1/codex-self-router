@@ -815,8 +815,70 @@ async def test_explicit_steer_switches_without_approval_before_forwarding(tmp_pa
 
     assert order == ["update", "steer"]
     assert bridge.threads["thread-1"].profile == ProfileName.ASTRA
+    assert bridge.threads["thread-1"].explicit_route_task_id == "turn-1"
     assert forwarded[0]["params"]["input"] == [{"type": "text", "text": "reconsider"}]
     assert bridge.report.switches[0].source == "user-directive"
+
+
+@pytest.mark.asyncio
+async def test_explicit_directive_blocks_agent_switch_for_that_task(tmp_path) -> None:
+    bridge = Bridge(
+        FakeWebSocket(),
+        codex_bin=Path("codex"),
+        report_store=ReportStore(tmp_path),
+        switch_approval=SwitchApproval.NEVER,
+    )
+    bridge.threads["thread-1"] = ThreadState(ProfileName.LUNA, effort="low")
+    upstream: list[dict] = []
+
+    async def send(message) -> None:
+        upstream.append(message)
+
+    bridge._send_upstream = send
+    await bridge._handle_client_payload(
+        json.dumps(
+            {
+                "id": 19,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "thread-1",
+                    "input": [{"type": "text", "text": "review this package a2"}],
+                },
+            }
+        )
+    )
+    await bridge._handle_upstream_payload(
+        json.dumps({"id": 19, "result": {"turn": {"id": "turn-1"}}})
+    )
+
+    state = bridge.threads["thread-1"]
+    assert (state.profile, state.effort) == (ProfileName.ASTRA, "medium")
+    assert state.explicit_route_task_id == "turn-1"
+
+    request = switch_request("blocked-switch")
+    request["params"]["arguments"]["targetProfile"] = "sol"
+    await bridge._handle_switch_call(request)
+
+    assert (state.profile, state.effort) == (ProfileName.ASTRA, "medium")
+    assert upstream[-1]["result"]["success"] is False
+    assert "explicitly selected" in upstream[-1]["result"]["contentItems"][0]["text"]
+    assert any(
+        event["kind"] == "agent_switch_rejected" and event["reason"] == "explicit-user-route"
+        for event in bridge.measurements.events
+    )
+
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }
+        )
+    )
+    assert state.explicit_route_task_id is None
 
 
 @pytest.mark.asyncio
@@ -861,6 +923,7 @@ async def test_temporary_directive_restores_route_after_task_completion(tmp_path
         "low",
     )
     assert state.temporary_task_id == "turn-1"
+    assert state.explicit_route_task_id == "turn-1"
 
     await bridge._handle_upstream_payload(
         json.dumps(
@@ -875,6 +938,7 @@ async def test_temporary_directive_restores_route_after_task_completion(tmp_path
     )
     assert (state.profile, state.effort) == (ProfileName.LUNA, "low")
     assert state.temporary_restore_profile is None
+    assert state.explicit_route_task_id is None
     assert bridge.report.switches[-1].source == "temporary-directive-restore"
     assert bridge.report.thread_states["thread-1"]["temporary_route"] is None
     notice = json.loads(websocket.sent[-1])
@@ -906,6 +970,7 @@ async def test_temporary_route_survives_router_continuation_boundary(tmp_path) -
         temporary_restore_profile=ProfileName.LUNA,
         temporary_restore_effort="low",
         temporary_task_id="turn-1",
+        explicit_route_task_id="turn-1",
     )
     bridge.threads["thread-1"] = state
     bridge.measurements.start_turn("thread-1", "turn-1")
@@ -923,6 +988,7 @@ async def test_temporary_route_survives_router_continuation_boundary(tmp_path) -
         )
     )
     assert state.temporary_restore_profile == ProfileName.LUNA
+    assert state.explicit_route_task_id == "turn-1"
     assert state.profile == ProfileName.ASTRA
 
     bridge.measurements.continuations["thread-1"] = "turn-1"
@@ -941,6 +1007,7 @@ async def test_temporary_route_survives_router_continuation_boundary(tmp_path) -
     )
     assert (state.profile, state.effort) == (ProfileName.LUNA, "low")
     assert state.temporary_restore_profile is None
+    assert state.explicit_route_task_id is None
 
 
 def test_explicit_model_change_cancels_pending_temporary_restore(tmp_path) -> None:

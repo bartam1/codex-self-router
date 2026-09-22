@@ -103,7 +103,9 @@ leading or trailing token before sending the instruction to the model.
 
 These markers bypass approval because they are explicit user authorization. Model switches
 requested by the agent through `self_router.request_model_switch` follow the configured
-`agent_switch_approval` policy. The agent can change only effort while keeping the model.
+`agent_switch_approval` policy on other tasks. A directive pins its selected model and effort for
+the current task, so the agent cannot override it. The agent can change only effort while keeping
+the model when no directive is active.
 A marker, including its temporary `~` form, also works when the instruction steers an
 already-running turn: the router applies `turn/settings/update` before forwarding the cleaned
 steering message.

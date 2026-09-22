@@ -276,6 +276,7 @@ async def test_resume_preserves_pending_temporary_route_restore(tmp_path):
         temporary_restore_profile=ProfileName.LUNA,
         temporary_restore_effort="low",
         temporary_task_id="turn-1",
+        explicit_route_task_id="turn-1",
     )
     old.measurements.start_turn("thread-1", "turn-1")
     old._checkpoint_thread("thread-1")
@@ -301,6 +302,7 @@ async def test_resume_preserves_pending_temporary_route_restore(tmp_path):
         assert state.temporary_restore_profile == ProfileName.LUNA
         assert state.temporary_restore_effort == "low"
         assert state.temporary_task_id == "turn-1"
+        assert state.explicit_route_task_id == "turn-1"
     finally:
         await cleanup(resumed)
 

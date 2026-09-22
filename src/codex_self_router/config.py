@@ -88,8 +88,8 @@ Model and reasoning routing is managed by the self-router.
 - If the current model or effort is uncertain, request what the phase needs; exact same-target
   requests are no-ops.
 - A leading or trailing user directive ({{directives}}) is explicit authorization handled before
-  inference; do not repeat it with the tool. A `~` suffix makes the directive temporary for that
-  task and restores the preceding route afterward.
+  inference. Its selected route is authoritative for that task; do not request another route until
+  a later user task. A `~` suffix restores the preceding route afterward.
 """
 
 

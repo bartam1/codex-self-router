@@ -41,8 +41,8 @@ routing_policy_template: |
   - If the current model or effort is uncertain, request what the phase needs; exact same-target
     requests are no-ops.
   - A leading or trailing user directive ({{directives}}) is explicit authorization handled before
-    inference; do not repeat it with the tool. A `~` suffix makes the directive temporary for that
-    task and restores the preceding route afterward.
+    inference. Its selected route is authoritative for that task; do not request another route
+    until a later user task. A `~` suffix restores the preceding route afterward.
 effort_levels: {'1': low, '2': medium, '3': xhigh}
 legacy_directives:
   '#1': {profile: luna, effort: medium}

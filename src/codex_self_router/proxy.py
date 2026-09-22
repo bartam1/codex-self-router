@@ -113,6 +113,7 @@ class ThreadState:
     temporary_restore_profile: ProfileName | None = None
     temporary_restore_effort: str | None = None
     temporary_task_id: str | None = None
+    explicit_route_task_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -333,6 +334,7 @@ class Bridge:
                 if state.temporary_restore_profile is not None
                 else None
             ),
+            "explicit_route_task_id": state.explicit_route_task_id,
             "routing_mode": self.report.metadata["routingMode"],
             "updated_at": utc_now(),
         }
@@ -463,12 +465,14 @@ class Bridge:
                     state.temporary_restore_profile = existing.temporary_restore_profile
                     state.temporary_restore_effort = existing.temporary_restore_effort
                     state.temporary_task_id = existing.temporary_task_id
+                    state.explicit_route_task_id = existing.explicit_route_task_id
                 else:
                     temporary = (checkpoint or {}).get("temporary_route")
                     if temporary:
                         state.temporary_restore_profile = ProfileName(temporary["restore_profile"])
                         state.temporary_restore_effort = str(temporary["restore_effort"])
                         state.temporary_task_id = temporary.get("task_id")
+                    state.explicit_route_task_id = (checkpoint or {}).get("explicit_route_task_id")
                 self.threads[thread_id] = state
                 if not existing:
                     identities, sessions = self.report_store.thread_history(thread_id)
@@ -802,9 +806,12 @@ class Bridge:
             waiter = self.turn_completion_waiters.get((thread_id, turn_id))
             if waiter is not None and not waiter.done():
                 waiter.set_result(message)
+            directive_lock_released = self._release_explicit_route_lock(thread_id, turn_id)
             restored = self._restore_temporary_route(thread_id, turn_id)
             if restored is not None:
                 restored_route = (thread_id, *restored)
+            elif directive_lock_released:
+                self._checkpoint_thread(thread_id)
 
         if is_route_state_tool_call(message):
             await self._handle_route_state_call(message)
@@ -877,6 +884,32 @@ class Bridge:
         state.temporary_restore_profile = None
         state.temporary_restore_effort = None
         state.temporary_task_id = None
+
+    def _release_explicit_route_lock(self, thread_id: str, turn_id: str) -> bool:
+        state = self.threads.get(thread_id)
+        if state is None or state.explicit_route_task_id is None:
+            return False
+        turn = self.measurements.turns.get((thread_id, turn_id), {})
+        task_id = str(turn.get("task_id") or turn_id)
+        if state.explicit_route_task_id != task_id:
+            return False
+        if turn.get("interruption_source") == "router":
+            return False
+        state.explicit_route_task_id = None
+        self.measurements.event(
+            "explicit_route_task_unlocked",
+            thread_id=thread_id,
+            turn_id=turn_id,
+            task_id=task_id,
+        )
+        return True
+
+    def _explicit_route_is_locked(self, state: ThreadState, thread_id: str, turn_id: str) -> bool:
+        if state.explicit_route_task_id is None:
+            return False
+        turn = self.measurements.turns.get((thread_id, turn_id), {})
+        task_id = str(turn.get("task_id") or turn_id)
+        return state.explicit_route_task_id == task_id
 
     def _restore_temporary_route(
         self, thread_id: str, turn_id: str
@@ -1048,6 +1081,8 @@ class Bridge:
             state.temporary_task_id = str(turn.get("task_id") or turn_id)
         else:
             self._clear_temporary_route(state)
+        turn = self.measurements.turns.get((thread_id, turn_id), {})
+        state.explicit_route_task_id = str(turn.get("task_id") or turn_id)
         self.report.add_directive(
             thread_id=thread_id,
             turn_id=turn_id,
@@ -1150,6 +1185,7 @@ class Bridge:
                 state = self.threads[context.thread_id]
                 state.effort = context.effort or PROFILES[context.profile].effort
                 if context.route.source == "user-directive":
+                    state.explicit_route_task_id = str(measured["task_id"])
                     if context.route.temporary:
                         if state.temporary_restore_profile is None:
                             state.temporary_restore_profile = context.previous_profile
@@ -1206,6 +1242,7 @@ class Bridge:
                 state.client_profile = state.profile
                 state.client_effort = state.effort
                 self._clear_temporary_route(state)
+                state.explicit_route_task_id = None
                 if state.collaboration_mode is not None:
                     settings = state.collaboration_mode.setdefault("settings", {})
                     settings["model"] = PROFILES[state.profile].model
@@ -1331,6 +1368,24 @@ class Bridge:
             if state is None:
                 await self._send_upstream(
                     _tool_result(request_id, "Router has no state for this thread.", success=False)
+                )
+                return
+            if self._explicit_route_is_locked(state, thread_id, turn_id):
+                self.measurements.event(
+                    "agent_switch_rejected",
+                    thread_id=thread_id,
+                    turn_id=turn_id,
+                    task_id=state.explicit_route_task_id,
+                    reason="explicit-user-route",
+                )
+                self._save_report()
+                await self._send_upstream(
+                    _tool_result(
+                        request_id,
+                        "The user explicitly selected the model and reasoning effort for this "
+                        "task. Keep the current route until the task ends.",
+                        success=False,
+                    )
                 )
                 return
             try:

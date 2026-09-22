@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-self-router"
-version = "0.6.0"
+version = "0.6.1"
 description = "A local Codex app-server proxy for explicit and agent-requested model routing"
 readme = "README.md"
 requires-python = ">=3.11"
