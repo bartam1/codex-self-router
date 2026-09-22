@@ -102,6 +102,24 @@ def test_model_effort_matrix_directives_select_route_and_are_removed() -> None:
             assert message["params"]["input"][0]["text"] == "do the work"
 
 
+@pytest.mark.parametrize("text", ["a2~ design it", "design it a2~"])
+def test_temporary_directive_selects_route_and_is_removed(text) -> None:
+    message, route = prepare_turn_start(
+        {
+            "method": "turn/start",
+            "params": {"input": [{"type": "text", "text": text}]},
+        },
+        resumed_profile=ProfileName.LUNA,
+        resumed_effort="low",
+    )
+
+    assert route.profile == ProfileName.ASTRA
+    assert route.effort == "medium"
+    assert route.marker == "a2~"
+    assert route.temporary
+    assert message["params"]["input"][0]["text"] == "design it"
+
+
 def test_legacy_directives_remain_supported() -> None:
     for marker, expected, effort in (
         ("#1", "luna", "medium"),
@@ -237,7 +255,7 @@ def test_directive_updates_collaboration_mode_that_would_otherwise_take_preceden
 
 
 def test_directive_on_active_turn_steer_is_removed_and_returned() -> None:
-    message, profile, effort, marker = prepare_turn_steer(
+    message, profile, effort, marker, temporary = prepare_turn_steer(
         {
             "id": 8,
             "method": "turn/steer",
@@ -251,6 +269,7 @@ def test_directive_on_active_turn_steer_is_removed_and_returned() -> None:
     assert profile == ProfileName.ASTRA
     assert effort == "xhigh"
     assert marker == "#3"
+    assert not temporary
     assert message["params"]["input"][0]["text"] == "reconsider the architecture"
 
 

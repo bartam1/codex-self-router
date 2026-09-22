@@ -20,6 +20,18 @@ def utc_now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def parse_timestamp(value: str) -> datetime:
+    """Parse an ISO timestamp and normalize missing offsets to UTC."""
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def normalize_timestamp(value: str) -> str:
+    return parse_timestamp(value).isoformat()
+
+
 def default_report_dir() -> Path:
     if sys.platform == "darwin":
         return Path.home() / "Library" / "Application Support" / "codex-self-router" / "reports"
@@ -213,7 +225,9 @@ class ReportStore:
     def read(self, path: Path) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
         feedback = self.report_dir / "feedback" / path.name
-        data["feedback"] = json.loads(feedback.read_text()) if feedback.exists() else {}
+        data["feedback"] = (
+            json.loads(feedback.read_text(encoding="utf-8")) if feedback.exists() else {}
+        )
         return data
 
     def all(self) -> list[dict[str, Any]]:

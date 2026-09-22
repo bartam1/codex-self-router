@@ -100,6 +100,18 @@ def test_rollout_only_counts_new_complete_records_and_verifies_tools(tmp_path):
         reader.events()
 
 
+def test_rollout_normalizes_naive_timestamps_to_utc(tmp_path):
+    path = rollout(tmp_path)
+    reader = RolloutReader(path, "thread-1")
+    reader.prime()
+    row = usage_row()
+    row["timestamp"] = "2026-01-01T12:34:56"
+    append(path, row)
+
+    (event,) = reader.events()
+    assert event["params"]["observedAt"] == "2026-01-01T12:34:56+00:00"
+
+
 def test_rollout_detects_legacy_tool_schema(tmp_path):
     old_tool = copy.deepcopy(ROUTING_TOOL_SPEC)
     old_tool["tools"][0]["inputSchema"]["properties"].pop("targetReasoningEffort")
@@ -248,6 +260,47 @@ async def test_astra_survives_restart_with_tool_policy_and_measurement_lineage(t
         assert group["tasks"] == 1
         assert group["responses"] == 2
         assert group["medianTaskWallMs"] is None
+    finally:
+        await cleanup(resumed)
+
+
+@pytest.mark.asyncio
+async def test_resume_preserves_pending_temporary_route_restore(tmp_path):
+    store = ReportStore(tmp_path / "reports")
+    path = rollout(tmp_path)
+    old = Bridge(Socket(), codex_bin=Path("codex"), report_store=store)
+    old.threads["thread-1"] = ThreadState(
+        ProfileName.ASTRA,
+        "turn-1",
+        effort="medium",
+        temporary_restore_profile=ProfileName.LUNA,
+        temporary_restore_effort="low",
+        temporary_task_id="turn-1",
+    )
+    old.measurements.start_turn("thread-1", "turn-1")
+    old._checkpoint_thread("thread-1")
+    await cleanup(old)
+
+    resumed = Bridge(Socket(), codex_bin=Path("codex"), report_store=store)
+
+    async def internal(method, params):
+        if method == "thread/read":
+            return {"result": {"thread": {"id": "thread-1", "path": str(path)}}}
+        return {
+            "result": {
+                "thread": {"id": "thread-1"},
+                "model": PROFILES[ProfileName.ASTRA].model,
+                "reasoningEffort": "medium",
+            }
+        }
+
+    resumed._internal_request = internal
+    try:
+        await resumed._resume_thread({"id": 1, "params": {"threadId": "thread-1"}})
+        state = resumed.threads["thread-1"]
+        assert state.temporary_restore_profile == ProfileName.LUNA
+        assert state.temporary_restore_effort == "low"
+        assert state.temporary_task_id == "turn-1"
     finally:
         await cleanup(resumed)
 

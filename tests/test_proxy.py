@@ -1,12 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 from pathlib import Path
 
 import pytest
 
-from codex_self_router.config import PROFILES, ProfileName, SwitchApproval
+from codex_self_router.config import (
+    DEFAULT_CONFIG,
+    PROFILES,
+    ProfileName,
+    SwitchApproval,
+    apply_config,
+)
 from codex_self_router.evaluation import analyze
 from codex_self_router.proxy import (
     Bridge,
@@ -156,8 +163,34 @@ async def test_get_current_route_returns_exact_router_state(tmp_path) -> None:
         "profile": "terra",
         "model": PROFILES[ProfileName.TERRA].model,
         "reasoningEffort": "low",
+        "agentSwitchingEnabled": True,
         "approvalPolicy": "never",
     }
+
+
+@pytest.mark.asyncio
+async def test_disabled_agent_switching_rejects_persisted_switch_tool(tmp_path) -> None:
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["agent_switching_enabled"] = False
+    apply_config(data)
+    bridge = Bridge(FakeWebSocket(), codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(ProfileName.SOL, "turn-1")
+    upstream: list[dict] = []
+
+    async def send(message) -> None:
+        upstream.append(message)
+
+    bridge._send_upstream = send
+    await bridge._handle_switch_call(switch_request())
+
+    assert bridge.threads["thread-1"].profile == ProfileName.SOL
+    assert bridge.report.switches == []
+    assert upstream[0]["result"]["success"] is False
+    assert "disabled by router configuration" in upstream[0]["result"]["contentItems"][0]["text"]
+    assert any(
+        event["kind"] == "agent_switch_rejected" and event["reason"] == "disabled-by-config"
+        for event in bridge.measurements.events
+    )
 
 
 @pytest.mark.asyncio
@@ -624,18 +657,125 @@ async def test_server_request_id_cannot_consume_client_response_context(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_fork_is_rejected_before_reaching_upstream(tmp_path) -> None:
+async def test_fork_inherits_route_and_tracks_independent_thread(tmp_path) -> None:
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-old"] = ThreadState(
+        ProfileName.ASTRA,
+        collaboration_mode={"mode": "default", "settings": {"model": "stale"}},
+        effort="xhigh",
+        client_profile=ProfileName.LUNA,
+        client_effort="medium",
+        temporary_restore_profile=ProfileName.LUNA,
+        temporary_restore_effort="low",
+        temporary_task_id="parent-task",
+    )
+    bridge._checkpoint_thread("thread-old", "parent instructions")
+    forwarded: list[dict] = []
+
+    async def send(message) -> None:
+        forwarded.append(message)
+
+    bridge._send_upstream = send
+
+    await bridge._handle_client_payload(
+        json.dumps(
+            {
+                "id": 9,
+                "method": "thread/fork",
+                "params": {
+                    "threadId": "thread-old",
+                    "model": PROFILES[ProfileName.LUNA].model,
+                    "config": {"existing": "kept"},
+                },
+            }
+        )
+    )
+
+    assert forwarded[0]["params"]["model"] == PROFILES[ProfileName.ASTRA].model
+    assert forwarded[0]["params"]["config"]["model_reasoning_effort"] == "xhigh"
+    assert forwarded[0]["params"]["config"]["existing"] == "kept"
+    assert _id_key(9) in bridge.client_requests
+
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "id": 9,
+                "result": {
+                    "thread": {"id": "thread-fork", "turns": []},
+                    "model": PROFILES[ProfileName.ASTRA].model,
+                    "reasoningEffort": "xhigh",
+                },
+            }
+        )
+    )
+
+    response = json.loads(websocket.sent[-1])
+    assert response["result"]["thread"]["id"] == "thread-fork"
+    fork = bridge.threads["thread-fork"]
+    assert (fork.profile, fork.effort) == (ProfileName.ASTRA, "xhigh")
+    assert fork.collaboration_mode == bridge.threads["thread-old"].collaboration_mode
+    assert fork.collaboration_mode is not bridge.threads["thread-old"].collaboration_mode
+    assert fork.temporary_restore_profile is None
+    assert bridge.threads["thread-old"].temporary_task_id == "parent-task"
+    assert bridge.report.thread_states["thread-fork"]["developer_instructions"] == (
+        "parent instructions"
+    )
+    assert bridge.report.metadata["forkedThreads"] == [
+        {
+            "sourceThreadId": "thread-old",
+            "threadId": "thread-fork",
+            "inheritedProfile": "astra",
+            "inheritedEffort": "xhigh",
+        }
+    ]
+
+    fork.profile = ProfileName.LUNA
+    assert bridge.threads["thread-old"].profile == ProfileName.ASTRA
+
+
+@pytest.mark.asyncio
+async def test_fork_rejects_untracked_source_thread(tmp_path) -> None:
     websocket = FakeWebSocket()
     bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
 
     await bridge._handle_client_payload(
-        json.dumps({"id": 9, "method": "thread/fork", "params": {"threadId": "thread-old"}})
+        json.dumps({"id": 9, "method": "thread/fork", "params": {"threadId": "missing"}})
     )
 
     response = json.loads(websocket.sent[0])
     assert response["id"] == 9
-    assert response["error"]["code"] == -32601
-    assert "fresh thread" in response["error"]["message"]
+    assert response["error"]["code"] == -32602
+    assert "source thread" in response["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_untracked_turn_uses_configured_default_as_previous_profile(tmp_path) -> None:
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["default_profile"] = "luna"
+    apply_config(data)
+    bridge = Bridge(FakeWebSocket(), codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    forwarded: list[dict] = []
+
+    async def send(message) -> None:
+        forwarded.append(message)
+
+    bridge._send_upstream = send
+    await bridge._handle_client_payload(
+        json.dumps(
+            {
+                "id": 10,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "untracked",
+                    "input": [{"type": "text", "text": "inspect"}],
+                },
+            }
+        )
+    )
+
+    assert forwarded[0]["params"]["model"] == PROFILES[ProfileName.LUNA].model
+    assert bridge.client_requests[_id_key(10)].previous_profile == ProfileName.LUNA
 
 
 @pytest.mark.asyncio
@@ -670,9 +810,161 @@ async def test_explicit_steer_switches_without_approval_before_forwarding(tmp_pa
         ProfileName.ASTRA,
         "xhigh",
         "#3",
+        temporary=False,
     )
 
     assert order == ["update", "steer"]
     assert bridge.threads["thread-1"].profile == ProfileName.ASTRA
     assert forwarded[0]["params"]["input"] == [{"type": "text", "text": "reconsider"}]
     assert bridge.report.switches[0].source == "user-directive"
+
+
+@pytest.mark.asyncio
+async def test_temporary_directive_restores_route_after_task_completion(tmp_path) -> None:
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(
+        ProfileName.LUNA,
+        effort="low",
+        client_profile=ProfileName.LUNA,
+        client_effort="low",
+    )
+    forwarded: list[dict] = []
+
+    async def send(message) -> None:
+        forwarded.append(message)
+
+    bridge._send_upstream = send
+    await bridge._handle_client_payload(
+        json.dumps(
+            {
+                "id": 20,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "thread-1",
+                    "input": [{"type": "text", "text": "a2~ design it"}],
+                },
+            }
+        )
+    )
+    assert forwarded[-1]["params"]["model"] == PROFILES[ProfileName.ASTRA].model
+    assert forwarded[-1]["params"]["effort"] == "medium"
+    assert forwarded[-1]["params"]["input"][0]["text"] == "design it"
+
+    await bridge._handle_upstream_payload(
+        json.dumps({"id": 20, "result": {"turn": {"id": "turn-1"}}})
+    )
+    state = bridge.threads["thread-1"]
+    assert (state.profile, state.effort) == (ProfileName.ASTRA, "medium")
+    assert (state.temporary_restore_profile, state.temporary_restore_effort) == (
+        ProfileName.LUNA,
+        "low",
+    )
+    assert state.temporary_task_id == "turn-1"
+
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }
+        )
+    )
+    assert (state.profile, state.effort) == (ProfileName.LUNA, "low")
+    assert state.temporary_restore_profile is None
+    assert bridge.report.switches[-1].source == "temporary-directive-restore"
+    assert bridge.report.thread_states["thread-1"]["temporary_route"] is None
+    notice = json.loads(websocket.sent[-1])
+    assert "restored route: luna/low" in notice["params"]["message"]
+
+    await bridge._handle_client_payload(
+        json.dumps(
+            {
+                "id": 21,
+                "method": "turn/start",
+                "params": {
+                    "threadId": "thread-1",
+                    "input": [{"type": "text", "text": "next task"}],
+                },
+            }
+        )
+    )
+    assert forwarded[-1]["params"]["model"] == PROFILES[ProfileName.LUNA].model
+    assert forwarded[-1]["params"]["effort"] == "low"
+
+
+@pytest.mark.asyncio
+async def test_temporary_route_survives_router_continuation_boundary(tmp_path) -> None:
+    bridge = Bridge(FakeWebSocket(), codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    state = ThreadState(
+        ProfileName.ASTRA,
+        "turn-1",
+        effort="medium",
+        temporary_restore_profile=ProfileName.LUNA,
+        temporary_restore_effort="low",
+        temporary_task_id="turn-1",
+    )
+    bridge.threads["thread-1"] = state
+    bridge.measurements.start_turn("thread-1", "turn-1")
+    bridge.measurements.interruptions[("thread-1", "turn-1")] = "router"
+
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "interrupted"},
+                },
+            }
+        )
+    )
+    assert state.temporary_restore_profile == ProfileName.LUNA
+    assert state.profile == ProfileName.ASTRA
+
+    bridge.measurements.continuations["thread-1"] = "turn-1"
+    bridge.measurements.start_turn("thread-1", "turn-2")
+    state.active_turn_id = "turn-2"
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-2", "status": "completed"},
+                },
+            }
+        )
+    )
+    assert (state.profile, state.effort) == (ProfileName.LUNA, "low")
+    assert state.temporary_restore_profile is None
+
+
+def test_explicit_model_change_cancels_pending_temporary_restore(tmp_path) -> None:
+    bridge = Bridge(FakeWebSocket(), codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    state = ThreadState(
+        ProfileName.ASTRA,
+        effort="medium",
+        temporary_restore_profile=ProfileName.LUNA,
+        temporary_restore_effort="low",
+        temporary_task_id="turn-1",
+    )
+    bridge.threads["thread-1"] = state
+
+    bridge._observe_client_response(
+        RequestContext(
+            "turn/settings/update",
+            thread_id="thread-1",
+            profile=ProfileName.SOL,
+            previous_profile=ProfileName.ASTRA,
+            previous_effort="medium",
+            effort="xhigh",
+        ),
+        {"result": {"status": "applied"}},
+    )
+
+    assert (state.profile, state.effort) == (ProfileName.SOL, "xhigh")
+    assert state.temporary_restore_profile is None

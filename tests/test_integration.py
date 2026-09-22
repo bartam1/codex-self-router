@@ -5,6 +5,7 @@ import json
 import pytest
 from websockets.asyncio.client import connect
 
+import codex_self_router.proxy as proxy_module
 from codex_self_router.cli import make_server
 from codex_self_router.config import PROFILES, ProfileName
 from codex_self_router.report import ReportStore
@@ -83,6 +84,10 @@ for line in sys.stdin:
             print(json.dumps(event), flush=True)
 """
 
+OVERFLOW_APP_SERVER = r"""#!/usr/bin/env python3
+print("x" * 1024, flush=True)
+"""
+
 
 async def receive_id(websocket, request_id: int) -> dict:
     while True:
@@ -96,6 +101,26 @@ async def receive_method(websocket, method: str) -> dict:
         message = json.loads(await websocket.recv())
         if message.get("method") == method:
             return message
+
+
+@pytest.mark.asyncio
+async def test_upstream_read_error_is_reported_before_disconnect(tmp_path, monkeypatch) -> None:
+    fake = tmp_path / "overflow-codex"
+    fake.write_text(OVERFLOW_APP_SERVER)
+    fake.chmod(0o755)
+    monkeypatch.setattr(proxy_module, "APP_SERVER_STREAM_LIMIT", 128)
+    store = ReportStore(tmp_path / "reports")
+    server = await make_server(fake, "127.0.0.1", 0, store)
+    host, port = server.sockets[0].getsockname()[:2]
+
+    try:
+        async with connect(f"ws://{host}:{port}") as websocket:
+            message = json.loads(await websocket.recv())
+            assert message["method"] == "error"
+            assert "could not read Codex app-server output" in message["params"]["message"]
+    finally:
+        server.close()
+        await server.wait_closed()
 
 
 @pytest.mark.asyncio

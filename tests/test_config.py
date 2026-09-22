@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 
 import pytest
 import yaml
@@ -9,10 +10,13 @@ from codex_self_router.config import (
     DEFAULT_CONFIG,
     DIRECTIVE_ROUTES,
     PROFILES,
+    ROUTER_STATE_TOOL,
+    ROUTING_TOOL_SPEC,
     ProfileName,
     SwitchApproval,
     apply_config,
     default_config_yaml,
+    get_agent_switching_enabled,
     get_default_profile,
     get_switch_approval,
     load_config,
@@ -34,6 +38,7 @@ def test_default_yaml_round_trips_and_exposes_full_matrix(tmp_path):
     path.write_text(default_config_yaml(), encoding="utf-8")
     assert load_config(path) == path
     assert get_default_profile() == ProfileName.SOL
+    assert get_agent_switching_enabled()
     assert get_switch_approval() == SwitchApproval.ALWAYS
     assert "Separate decision-making from mechanical execution" in routing_policy()
     assert "{{profiles}}" not in routing_policy()
@@ -88,6 +93,21 @@ def test_invalid_yaml_routes_fail_closed():
     with pytest.raises(ValueError, match="unknown routing_policy_template placeholders"):
         apply_config(data)
 
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["agent_switching_enabled"] = "no"
+    with pytest.raises(ValueError, match="must be true or false"):
+        apply_config(data)
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["legacy_directives"]["l1"] = {"profile": "astra", "effort": "xhigh"}
+    with pytest.raises(ValueError, match="duplicate directive marker l1"):
+        apply_config(data)
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["profiles"]["luna"]["price"]["input"] = math.nan
+    with pytest.raises(ValueError, match="finite and non-negative"):
+        apply_config(data)
+
 
 def test_switch_approval_policy_controls_prompting():
     data = copy.deepcopy(DEFAULT_CONFIG)
@@ -120,6 +140,49 @@ def test_switch_approval_policy_controls_prompting():
     )
 
 
+def test_upgrades_only_uses_semantic_effort_order_not_yaml_order():
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["effort_levels"] = {"3": "xhigh", "1": "low", "2": "medium"}
+    apply_config(data)
+
+    assert switch_requires_approval(
+        ProfileName.SOL,
+        "low",
+        ProfileName.SOL,
+        "xhigh",
+        SwitchApproval.UPGRADES_ONLY,
+    )
+    assert not switch_requires_approval(
+        ProfileName.SOL,
+        "xhigh",
+        ProfileName.SOL,
+        "low",
+        SwitchApproval.UPGRADES_ONLY,
+    )
+
+
+def test_agent_switching_can_be_disabled_without_disabling_user_directives():
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["agent_switching_enabled"] = False
+    apply_config(data)
+
+    assert not get_agent_switching_enabled()
+    assert [tool["name"] for tool in ROUTING_TOOL_SPEC["tools"]] == [ROUTER_STATE_TOOL]
+    assert "Agent-requested model and reasoning-effort switches are disabled" in routing_policy()
+    assert parse_directive("a2~ design it").profile == ProfileName.ASTRA
+
+
+def test_old_policy_template_gets_authoritative_agent_switch_status():
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["agent_switching_enabled"] = False
+    data["routing_policy_template"] = "Custom policy. {{profiles}}"
+    apply_config(data)
+
+    assert routing_policy().startswith(
+        "- Agent-requested model and reasoning-effort switches are disabled"
+    )
+
+
 def test_custom_policy_template_is_injected_and_old_config_falls_back():
     data = copy.deepcopy(DEFAULT_CONFIG)
     data["routing_policy_template"] = "Custom policy.\n{{approval_mode}}\n{{profiles}}\n"
@@ -130,4 +193,4 @@ def test_custom_policy_template_is_injected_and_old_config_falls_back():
 
     del data["routing_policy_template"]
     apply_config(data)
-    assert routing_policy().startswith("Model and reasoning routing is available")
+    assert routing_policy().startswith("Model and reasoning routing is managed")

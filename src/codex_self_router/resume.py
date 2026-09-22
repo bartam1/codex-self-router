@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import ROUTER_NAMESPACE, ROUTER_STATE_TOOL, ROUTER_TOOL
+from .report import normalize_timestamp
 
 TOKEN_NAMES = {
     "input_tokens": "inputTokens",
@@ -144,6 +145,11 @@ class RolloutReader:
                 )
             elif kind == "token_usage_record" and payload.get("thread_id") == self.thread_id:
                 usage = payload.get("usage")
+                observed_at = row.get("timestamp")
+                if observed_at is not None:
+                    if not isinstance(observed_at, str):
+                        raise ValueError("rollout timestamp must be an ISO string")
+                    observed_at = normalize_timestamp(observed_at)
                 events.append(
                     {
                         "method": "rawResponse/completed",
@@ -159,7 +165,7 @@ class RolloutReader:
                             if isinstance(usage, dict)
                             else None,
                             "usageSource": "codex-rollout",
-                            "observedAt": row.get("timestamp"),
+                            "observedAt": observed_at,
                         },
                     }
                 )

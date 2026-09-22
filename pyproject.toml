@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "codex-self-router"
-version = "0.5.3"
+version = "0.6.0"
 description = "A local Codex app-server proxy for explicit and agent-requested model routing"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -17,6 +17,11 @@ dev = ["pytest>=8.3", "pytest-asyncio>=0.25", "ruff>=0.11"]
 
 [project.scripts]
 codex-self-router = "codex_self_router.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/bartam1/codex-self-router"
+Repository = "https://github.com/bartam1/codex-self-router.git"
+Issues = "https://github.com/bartam1/codex-self-router/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/codex_self_router"]

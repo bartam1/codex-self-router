@@ -20,8 +20,10 @@ from .config import (
     SwitchApproval,
     default_config_path,
     default_config_yaml,
+    get_agent_switching_enabled,
     get_switch_approval,
     load_config,
+    set_agent_switching_enabled,
     set_switch_approval,
 )
 from .evaluation import aggregate, analyze
@@ -45,9 +47,23 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help=f"router YAML configuration (default: {default_config_path()})",
     )
+    parser.add_argument(
+        "--disable-agent-switching",
+        action="store_true",
+        help="disable agent-requested route changes for this process",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
+    def add_agent_switching_override(command: argparse.ArgumentParser) -> None:
+        command.add_argument(
+            "--disable-agent-switching",
+            action="store_true",
+            default=argparse.SUPPRESS,
+            help="disable agent-requested route changes for this process",
+        )
+
     run = subparsers.add_parser("run", help="start the router and a connected Codex TUI")
+    add_agent_switching_override(run)
     run.add_argument("--label", help="evaluation cohort or benchmark task label")
     run.add_argument(
         "--fixed-profile", choices=list(ProfileName), help="disable routing for a control run"
@@ -65,6 +81,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--skip-version-check", action="store_true", help=argparse.SUPPRESS)
 
     serve = subparsers.add_parser("serve", help="serve a WebSocket endpoint for codex --remote")
+    add_agent_switching_override(serve)
     serve.add_argument("--listen", default="127.0.0.1:4501", metavar="HOST:PORT")
     serve.add_argument("--label", help="evaluation cohort or benchmark task label")
     serve.add_argument(
@@ -97,7 +114,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     feedback.add_argument("--note", help="optional assessment, saved locally")
 
-    subparsers.add_parser("doctor", help="check the local Codex binary and router profiles")
+    doctor = subparsers.add_parser(
+        "doctor", help="check the local Codex binary and router profiles"
+    )
+    add_agent_switching_override(doctor)
     init_config = subparsers.add_parser("init-config", help="write a default router config.yaml")
     init_config.add_argument("--force", action="store_true", help="replace an existing config")
     return parser
@@ -276,6 +296,8 @@ async def async_main(args: argparse.Namespace) -> int:
         print(f"Wrote {destination}")
         return 0
     loaded_config = load_config(args.config)
+    if args.disable_agent_switching:
+        set_agent_switching_enabled(False)
     if args.command in {"run", "serve"} and args.switch_approval:
         set_switch_approval(args.switch_approval)
     store = ReportStore(args.report_dir)
@@ -321,6 +343,10 @@ async def async_main(args: argparse.Namespace) -> int:
         print(f"Config: {loaded_config or 'built-in defaults'}")
         status = "compatible" if version >= MINIMUM_CODEX_VERSION else "too old"
         print(f"App-server switching support: {status}")
+        print(
+            "Agent-requested switching: "
+            + ("enabled" if get_agent_switching_enabled() else "disabled")
+        )
         print(f"Agent switch approval: {get_switch_approval().value}")
         for marker, (name, effort) in DIRECTIVE_ROUTES.items():
             if marker.startswith("#"):

@@ -9,7 +9,6 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +20,8 @@ from .config import (
     ProfileName,
     SwitchApproval,
     config_snapshot,
+    get_agent_switching_enabled,
+    get_default_profile,
     get_switch_approval,
     merge_routing_policy,
     profile_for_model,
@@ -28,7 +29,7 @@ from .config import (
     switch_requires_approval,
 )
 from .measurement import Measurements
-from .report import ReportStore, SessionReport, SwitchRecord, UsageRecord, utc_now
+from .report import ReportStore, SessionReport, SwitchRecord, UsageRecord, parse_timestamp, utc_now
 from .resume import RolloutReader, ThreadLease
 from .transform import (
     TurnRoute,
@@ -109,6 +110,9 @@ class ThreadState:
     effort: str | None = None
     client_profile: ProfileName | None = None
     client_effort: str | None = None
+    temporary_restore_profile: ProfileName | None = None
+    temporary_restore_effort: str | None = None
+    temporary_task_id: str | None = None
 
 
 @dataclass(slots=True)
@@ -121,6 +125,7 @@ class RequestContext:
     route: TurnRoute | None = None
     submitted_event: dict[str, Any] | None = None
     developer_instructions: str | None = None
+    collaboration_mode: dict[str, Any] | None = None
     effort: str | None = None
     client_route_changed: bool = False
 
@@ -144,6 +149,7 @@ class Bridge:
         self.report = SessionReport(session_id=str(uuid.uuid4()))
         self.fixed_profile = fixed_profile
         self.switch_approval = switch_approval or get_switch_approval()
+        self.agent_switching_enabled = get_agent_switching_enabled()
         self.report.metadata = {
             "routerVersion": __version__,
             "codexBinary": str(codex_bin),
@@ -214,7 +220,22 @@ class Bridge:
                     client_read = asyncio.create_task(self.websocket.recv(), name="client-read")
 
                 if upstream_read in done:
-                    line = upstream_read.result()
+                    try:
+                        line = upstream_read.result()
+                    except Exception as exc:
+                        with contextlib.suppress(Exception):
+                            await self._send_client(
+                                {
+                                    "method": "error",
+                                    "params": {
+                                        "message": (
+                                            "could not read Codex app-server output: "
+                                            f"{type(exc).__name__}: {exc}"
+                                        )
+                                    },
+                                }
+                            )
+                        break
                     if not line:
                         code = await self.process.wait()
                         if code != 0:
@@ -303,6 +324,15 @@ class Bridge:
             "developer_instructions": instructions
             if instructions is not None
             else prior.get("developer_instructions"),
+            "temporary_route": (
+                {
+                    "restore_profile": state.temporary_restore_profile.value,
+                    "restore_effort": state.temporary_restore_effort,
+                    "task_id": state.temporary_task_id,
+                }
+                if state.temporary_restore_profile is not None
+                else None
+            ),
             "routing_mode": self.report.metadata["routingMode"],
             "updated_at": utc_now(),
         }
@@ -324,7 +354,7 @@ class Bridge:
                     await self._observe_raw_item(event)
                 else:
                     await self._observe_raw_response(event)
-        except (OSError, ValueError) as exc:
+        except (OSError, TypeError, ValueError) as exc:
             self.rollout_failed.add(thread_id)
             note = f"Resume usage capture failed for {thread_id}: {exc}"
             self.report.notes.append(note)
@@ -430,6 +460,15 @@ class Bridge:
                 )
                 if existing:
                     state.active_turn_id = existing.active_turn_id
+                    state.temporary_restore_profile = existing.temporary_restore_profile
+                    state.temporary_restore_effort = existing.temporary_restore_effort
+                    state.temporary_task_id = existing.temporary_task_id
+                else:
+                    temporary = (checkpoint or {}).get("temporary_route")
+                    if temporary:
+                        state.temporary_restore_profile = ProfileName(temporary["restore_profile"])
+                        state.temporary_restore_effort = str(temporary["restore_effort"])
+                        state.temporary_task_id = temporary.get("task_id")
                 self.threads[thread_id] = state
                 if not existing:
                     identities, sessions = self.report_store.thread_history(thread_id)
@@ -540,15 +579,6 @@ class Bridge:
         if method == "thread/resume" and "id" in message:
             self._start_background(self._resume_thread(message), "thread-resume")
             return
-        if method == "thread/fork" and "id" in message:
-            await self._send_client(
-                _rpc_error(
-                    request_id,
-                    -32601,
-                    "thread/fork is not supported; use thread/resume or start a fresh thread",
-                )
-            )
-            return
 
         if self.fixed_profile and method == "turn/settings/update":
             await self._send_client(
@@ -570,11 +600,46 @@ class Bridge:
             except ValueError as exc:
                 await self._send_client(_rpc_error(request_id, -32602, str(exc)))
                 return
+        elif method == "thread/fork":
+            message = copy.deepcopy(message)
+            params = message.setdefault("params", {})
+            source_thread_id = str(params.get("threadId", ""))
+            source = self.threads.get(source_thread_id)
+            if source is None:
+                await self._send_client(
+                    _rpc_error(request_id, -32602, "router has no state for the source thread")
+                )
+                return
+            profile = self.fixed_profile or source.profile
+            effort = (
+                PROFILES[self.fixed_profile].effort
+                if self.fixed_profile
+                else source.effort or PROFILES[source.profile].effort
+            )
+            params["model"] = PROFILES[profile].model
+            config = params.get("config")
+            if not isinstance(config, dict):
+                config = {}
+                params["config"] = config
+            config["model_reasoning_effort"] = effort
+            instructions = params.get("developerInstructions")
+            if instructions is not None and self.fixed_profile is None:
+                instructions = merge_routing_policy(instructions)
+                params["developerInstructions"] = instructions
+            if instructions is None:
+                instructions = self.report.thread_states.get(source_thread_id, {}).get(
+                    "developer_instructions"
+                )
+            context.thread_id = source_thread_id
+            context.profile = profile
+            context.effort = effort
+            context.developer_instructions = instructions
+            context.collaboration_mode = copy.deepcopy(source.collaboration_mode)
         elif method == "turn/start":
             thread_id = str(message.get("params", {}).get("threadId", ""))
             context.thread_id = thread_id
             context.previous_profile = self.threads.get(
-                thread_id, ThreadState(ProfileName.SOL)
+                thread_id, ThreadState(get_default_profile())
             ).profile
             previous_state = self.threads.get(thread_id)
             context.previous_effort = (
@@ -647,7 +712,7 @@ class Bridge:
             context.profile = requested_profile or state.profile
             context.effort = str(params.get("effort") or context.previous_effort)
         elif method == "turn/steer":
-            message, target, effort, marker = prepare_turn_steer(message)
+            message, target, effort, marker, temporary = prepare_turn_steer(message)
             if (
                 self.fixed_profile
                 and target
@@ -663,7 +728,9 @@ class Bridge:
                 return
             if target is not None and marker is not None:
                 self._start_background(
-                    self._apply_user_steer(message, target, str(effort), marker),
+                    self._apply_user_steer(
+                        message, target, str(effort), marker, temporary=temporary
+                    ),
                     "user-directive-steer",
                 )
                 return
@@ -703,6 +770,7 @@ class Bridge:
 
         method = message.get("method")
         params = message.get("params", {})
+        restored_route: tuple[str, ProfileName, str] | None = None
         event_turn = (str(params.get("threadId", "")), str(params.get("turnId", "")))
         if event_turn in self.automatic_continuation_turns and _is_async_question_item(message):
             if method == "item/completed":
@@ -734,6 +802,9 @@ class Bridge:
             waiter = self.turn_completion_waiters.get((thread_id, turn_id))
             if waiter is not None and not waiter.done():
                 waiter.set_result(message)
+            restored = self._restore_temporary_route(thread_id, turn_id)
+            if restored is not None:
+                restored_route = (thread_id, *restored)
 
         if is_route_state_tool_call(message):
             await self._handle_route_state_call(message)
@@ -751,6 +822,8 @@ class Bridge:
             self._start_background(self._handle_switch_call(message), "model-switch")
             return
         await self._send_client(message)
+        if restored_route is not None:
+            await self._notify_restored_route(*restored_route)
 
     async def _handle_route_state_call(self, message: dict[str, Any]) -> None:
         params = message.get("params", {})
@@ -769,6 +842,7 @@ class Bridge:
             "profile": state.profile.value,
             "model": PROFILES[state.profile].model,
             "reasoningEffort": effort,
+            "agentSwitchingEnabled": self.agent_switching_enabled,
             "approvalPolicy": self.switch_approval.value,
         }
         self.measurements.event(
@@ -793,6 +867,78 @@ class Bridge:
                         f"Self-router active route: {profile.value}/{effort} "
                         f"({PROFILES[profile].model}). The Codex model label may lag until the "
                         "current turn completes."
+                    ),
+                },
+            }
+        )
+
+    @staticmethod
+    def _clear_temporary_route(state: ThreadState) -> None:
+        state.temporary_restore_profile = None
+        state.temporary_restore_effort = None
+        state.temporary_task_id = None
+
+    def _restore_temporary_route(
+        self, thread_id: str, turn_id: str
+    ) -> tuple[ProfileName, str] | None:
+        state = self.threads.get(thread_id)
+        if state is None or state.temporary_restore_profile is None:
+            return None
+        turn = self.measurements.turns.get((thread_id, turn_id), {})
+        task_id = str(turn.get("task_id") or turn_id)
+        if state.temporary_task_id not in {None, task_id}:
+            return None
+        if turn.get("interruption_source") == "router":
+            return None
+
+        previous = state.profile
+        previous_effort = state.effort or PROFILES[previous].effort
+        target = state.temporary_restore_profile
+        target_effort = state.temporary_restore_effort or PROFILES[target].effort
+        state.profile = target
+        state.effort = target_effort
+        if state.collaboration_mode is not None:
+            settings = state.collaboration_mode.setdefault("settings", {})
+            settings["model"] = PROFILES[target].model
+            settings["reasoning_effort"] = target_effort
+        self._clear_temporary_route(state)
+        self.report.switches.append(
+            SwitchRecord(
+                timestamp=utc_now(),
+                thread_id=thread_id,
+                turn_id=turn_id,
+                from_profile=previous.value,
+                to_profile=target.value,
+                source="temporary-directive-restore",
+                outcome="applied",
+                detail="Restored the route active before the task-scoped directive.",
+                response_index=len(self.report.responses),
+                from_effort=previous_effort,
+                to_effort=target_effort,
+            )
+        )
+        self.measurements.event(
+            "temporary_route_restored",
+            thread_id=thread_id,
+            turn_id=turn_id,
+            task_id=task_id,
+            profile=target.value,
+            effort=target_effort,
+        )
+        self._checkpoint_thread(thread_id)
+        return target, target_effort
+
+    async def _notify_restored_route(
+        self, thread_id: str, profile: ProfileName, effort: str
+    ) -> None:
+        await self._send_client(
+            {
+                "method": "warning",
+                "params": {
+                    "threadId": thread_id,
+                    "message": (
+                        f"Self-router restored route: {profile.value}/{effort} "
+                        f"({PROFILES[profile].model})."
                     ),
                 },
             }
@@ -834,7 +980,13 @@ class Bridge:
         await self._send_client({"method": "warning", "params": {"message": message}})
 
     async def _apply_user_steer(
-        self, message: dict[str, Any], target: ProfileName, effort: str, marker: str
+        self,
+        message: dict[str, Any],
+        target: ProfileName,
+        effort: str,
+        marker: str,
+        *,
+        temporary: bool,
     ) -> None:
         params = message.get("params", {})
         request_id = message.get("id")
@@ -888,6 +1040,14 @@ class Bridge:
                 return
             state.profile = target
             state.effort = effort
+        if temporary:
+            if state.temporary_restore_profile is None:
+                state.temporary_restore_profile = previous
+                state.temporary_restore_effort = previous_effort
+            turn = self.measurements.turns.get((thread_id, turn_id), {})
+            state.temporary_task_id = str(turn.get("task_id") or turn_id)
+        else:
+            self._clear_temporary_route(state)
         self.report.add_directive(
             thread_id=thread_id,
             turn_id=turn_id,
@@ -922,6 +1082,61 @@ class Bridge:
                     client_effort=response.get("result", {}).get("reasoningEffort"),
                 )
                 self._checkpoint_thread(str(thread_id), context.developer_instructions)
+        elif context.method == "thread/fork" and context.thread_id and context.profile:
+            result = response.get("result", {})
+            thread_id = str(result.get("thread", {}).get("id", ""))
+            result_profile = profile_for_model(result.get("model"))
+            result_effort = result.get("reasoningEffort") or context.effort
+            if (
+                not thread_id
+                or result_profile != context.profile
+                or result_effort != context.effort
+            ):
+                request_id = response.get("id")
+                response.clear()
+                response.update(
+                    _rpc_error(
+                        request_id,
+                        -32602,
+                        "app-server forked an unexpected thread or did not preserve its route",
+                    )
+                )
+                return
+            state = ThreadState(
+                result_profile,
+                collaboration_mode=copy.deepcopy(context.collaboration_mode),
+                effort=str(result_effort),
+                client_profile=result_profile,
+                client_effort=str(result_effort),
+            )
+            self.threads[thread_id] = state
+            try:
+                self._checkpoint_thread(thread_id, context.developer_instructions)
+            except (OSError, ValueError) as exc:
+                self.threads.pop(thread_id, None)
+                lease = self.thread_leases.pop(thread_id, None)
+                if lease is not None:
+                    lease.close()
+                request_id = response.get("id")
+                response.clear()
+                response.update(_rpc_error(request_id, -32602, f"cannot track fork: {exc}"))
+                return
+            self.report.metadata.setdefault("forkedThreads", []).append(
+                {
+                    "sourceThreadId": context.thread_id,
+                    "threadId": thread_id,
+                    "inheritedProfile": result_profile.value,
+                    "inheritedEffort": str(result_effort),
+                }
+            )
+            self.measurements.event(
+                "thread_forked",
+                thread_id=thread_id,
+                source_thread_id=context.thread_id,
+                profile=result_profile.value,
+                effort=str(result_effort),
+            )
+            self._save_report()
         elif context.method == "turn/start" and context.thread_id and context.route:
             turn_id = response.get("result", {}).get("turn", {}).get("id")
             if turn_id:
@@ -932,12 +1147,20 @@ class Bridge:
                     measured["started_at"] = context.submitted_event["timestamp"]
                 measured["requested_profile"] = context.profile
                 measured["requested_effort"] = context.route.effort
-                self.threads[context.thread_id].effort = (
-                    context.effort or PROFILES[context.profile].effort
-                )
+                state = self.threads[context.thread_id]
+                state.effort = context.effort or PROFILES[context.profile].effort
+                if context.route.source == "user-directive":
+                    if context.route.temporary:
+                        if state.temporary_restore_profile is None:
+                            state.temporary_restore_profile = context.previous_profile
+                            state.temporary_restore_effort = context.previous_effort
+                        state.temporary_task_id = str(measured["task_id"])
+                    else:
+                        self._clear_temporary_route(state)
                 if context.client_route_changed and context.route.source == "client-override":
-                    self.threads[context.thread_id].client_profile = context.profile
-                    self.threads[context.thread_id].client_effort = context.effort
+                    state.client_profile = context.profile
+                    state.client_effort = context.effort
+                    self._clear_temporary_route(state)
                 self._checkpoint_thread(context.thread_id)
             if context.route.source == "user-directive" and context.route.marker:
                 self.report.add_directive(
@@ -982,6 +1205,7 @@ class Bridge:
                 state.effort = context.effort or PROFILES[context.profile].effort
                 state.client_profile = state.profile
                 state.client_effort = state.effort
+                self._clear_temporary_route(state)
                 if state.collaboration_mode is not None:
                     settings = state.collaboration_mode.setdefault("settings", {})
                     settings["model"] = PROFILES[state.profile].model
@@ -1046,9 +1270,7 @@ class Bridge:
                 profile_name, effort = history[0][1:]
                 if observed_at:
                     for changed_at, candidate, candidate_effort in history:
-                        if datetime.fromisoformat(changed_at) <= datetime.fromisoformat(
-                            observed_at
-                        ):
+                        if parse_timestamp(changed_at) <= parse_timestamp(observed_at):
                             profile_name = candidate
                             effort = candidate_effort
         usage = params.get("usage")
@@ -1086,6 +1308,23 @@ class Bridge:
         thread_id = str(params.get("threadId", ""))
         turn_id = str(params.get("turnId", ""))
         call_id = str(params.get("callId", ""))
+        if not self.agent_switching_enabled:
+            self.measurements.event(
+                "agent_switch_rejected",
+                thread_id=thread_id,
+                turn_id=turn_id,
+                reason="disabled-by-config",
+            )
+            self._save_report()
+            await self._send_upstream(
+                _tool_result(
+                    request_id,
+                    "Agent-requested model switching is disabled by router configuration. "
+                    "Only explicit user directives or manual model changes can change the route.",
+                    success=False,
+                )
+            )
+            return
         lock = self.turn_locks.setdefault((thread_id, turn_id), asyncio.Lock())
         async with lock:
             state = self.threads.get(thread_id)

@@ -32,6 +32,7 @@ class DirectiveResult:
     effort: str | None
     marker: str | None
     text: str
+    temporary: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,6 +41,14 @@ class TurnRoute:
     effort: str
     source: str
     marker: str | None = None
+    temporary: bool = False
+
+
+def _route_for_marker(marker: str) -> tuple[ProfileName, str, bool] | None:
+    temporary = marker.endswith("~")
+    base = marker[:-1] if temporary else marker
+    route = DIRECTIVE_ROUTES.get(base)
+    return (*route, temporary) if route is not None else None
 
 
 def _apply_directive_to_first_text(params: dict[str, Any]) -> DirectiveResult:
@@ -55,9 +64,9 @@ def _apply_directive_to_first_text(params: dict[str, Any]) -> DirectiveResult:
 
 def parse_directive(text: str) -> DirectiveResult:
     leading_match = _LEADING_DIRECTIVE.match(text)
-    if leading_match is not None and leading_match.group("marker") in DIRECTIVE_ROUTES:
+    if leading_match is not None and (route := _route_for_marker(leading_match.group("marker"))):
         marker = leading_match.group("marker")
-        profile, effort = DIRECTIVE_ROUTES[marker]
+        profile, effort, temporary = route
         # Remove the control marker from model-visible content while preserving intentional
         # leading whitespace and avoiding a surprising leading blank line.
         rest = leading_match.group("rest")
@@ -65,17 +74,20 @@ def parse_directive(text: str) -> DirectiveResult:
             rest = rest[2:]
         elif rest.startswith(("\n", " ", "\t")):
             rest = rest[1:]
-        return DirectiveResult(profile, effort, marker, leading_match.group("leading") + rest)
+        return DirectiveResult(
+            profile, effort, marker, leading_match.group("leading") + rest, temporary
+        )
 
     trailing_match = _TRAILING_DIRECTIVE.match(text)
-    if trailing_match is not None and trailing_match.group("marker") in DIRECTIVE_ROUTES:
+    if trailing_match is not None and (route := _route_for_marker(trailing_match.group("marker"))):
         marker = trailing_match.group("marker")
-        profile, effort = DIRECTIVE_ROUTES[marker]
+        profile, effort, temporary = route
         return DirectiveResult(
             profile,
             effort,
             marker,
             trailing_match.group("body") + trailing_match.group("trailing"),
+            temporary,
         )
     return DirectiveResult(None, None, None, text)
 
@@ -171,16 +183,16 @@ def prepare_turn_start(
         settings = collaboration_mode.setdefault("settings", {})
         settings["model"] = profile.model
         settings["reasoning_effort"] = effort
-    return result, TurnRoute(selected, effort, source, marker)
+    return result, TurnRoute(selected, effort, source, marker, directive.temporary)
 
 
 def prepare_turn_steer(
     message: dict[str, Any],
-) -> tuple[dict[str, Any], ProfileName | None, str | None, str | None]:
+) -> tuple[dict[str, Any], ProfileName | None, str | None, str | None, bool]:
     result = copy.deepcopy(message)
     params = result.setdefault("params", {})
     directive = _apply_directive_to_first_text(params)
-    return result, directive.profile, directive.effort, directive.marker
+    return result, directive.profile, directive.effort, directive.marker, directive.temporary
 
 
 def is_router_tool_call(message: dict[str, Any], tool: str = ROUTER_TOOL) -> bool:

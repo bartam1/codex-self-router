@@ -241,3 +241,17 @@ def test_run_parses_switch_approval_override():
     args = build_parser().parse_args(["run", "--switch-approval", "never", "--", "--full-auto"])
     assert args.switch_approval == "never"
     assert args.codex_args == ["--", "--full-auto"]
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--disable-agent-switching", "run"],
+        ["run", "--disable-agent-switching"],
+        ["serve", "--disable-agent-switching"],
+        ["doctor", "--disable-agent-switching"],
+    ],
+)
+def test_disable_agent_switching_override_parses_before_or_after_command(arguments):
+    args = build_parser().parse_args(arguments)
+    assert args.disable_agent_switching is True

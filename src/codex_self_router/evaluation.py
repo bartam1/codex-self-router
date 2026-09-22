@@ -3,11 +3,10 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict
-from datetime import datetime
 from statistics import mean, median
 from typing import Any
 
-from .report import usage_cost
+from .report import parse_timestamp, usage_cost
 
 
 def interval_union_ms(intervals: list[tuple[float, float]]) -> float:
@@ -156,13 +155,13 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
         if any(r.get("usage_source") == "codex-rollout" for r in task_responses):
             # A rollout can flush the requesting response after a switch was
             # recorded. File-arrival indexes are not sampling boundaries.
-            start_at = datetime.fromisoformat(switch["timestamp"])
-            stop_at = datetime.fromisoformat(next_switch["timestamp"]) if next_switch else None
+            start_at = parse_timestamp(switch["timestamp"])
+            stop_at = parse_timestamp(next_switch["timestamp"]) if next_switch else None
             phase = [
                 r
                 for r in task_responses
-                if datetime.fromisoformat(r["timestamp"]) >= start_at
-                and (stop_at is None or datetime.fromisoformat(r["timestamp"]) < stop_at)
+                if parse_timestamp(r["timestamp"]) >= start_at
+                and (stop_at is None or parse_timestamp(r["timestamp"]) < stop_at)
             ]
         summary = response_summary(phase, prices)
         previous_price = prices.get(switch.get("from_profile"))

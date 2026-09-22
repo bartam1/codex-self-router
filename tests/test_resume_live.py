@@ -80,6 +80,133 @@ async def complete_turn(ws):
 
 
 @pytest.mark.asyncio
+async def test_real_fork_inherits_route_and_is_reported(tmp_path):
+    binary = Path(os.environ["ROUTER_LIVE_CODEX"])
+    store = ReportStore(tmp_path / "reports")
+    server = await make_server(binary, "127.0.0.1", 0, store)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            await start_client(ws)
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": 2,
+                        "method": "thread/start",
+                        "params": {
+                            "model": PROFILES[ProfileName.LUNA].model,
+                            "cwd": str(tmp_path),
+                            "sandbox": "read-only",
+                            "approvalPolicy": "never",
+                        },
+                    }
+                )
+            )
+            started = await response(ws, 2)
+            source_thread = started["thread"]["id"]
+            source_effort = started["reasoningEffort"]
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": 3,
+                        "method": "turn/start",
+                        "params": {
+                            "threadId": source_thread,
+                            "input": [{"type": "text", "text": "Reply READY. Use no tools."}],
+                        },
+                    }
+                )
+            )
+            await response(ws, 3)
+            assert await complete_turn(ws) == 0
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": 4,
+                        "method": "thread/fork",
+                        "params": {"threadId": source_thread},
+                    }
+                )
+            )
+            forked = await response(ws, 4)
+            fork_thread = forked["thread"]["id"]
+            assert fork_thread != source_thread
+            assert forked["model"] == PROFILES[ProfileName.LUNA].model
+            assert forked["reasoningEffort"] == source_effort
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    report = store.latest()
+    assert report["threadStates"][source_thread]["profile"] == "luna"
+    assert report["threadStates"][fork_thread]["profile"] == "luna"
+    assert report["metadata"]["forkedThreads"] == [
+        {
+            "sourceThreadId": source_thread,
+            "threadId": fork_thread,
+            "inheritedProfile": "luna",
+            "inheritedEffort": source_effort,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_real_temporary_directive_restores_route_for_next_task(tmp_path):
+    binary = Path(os.environ["ROUTER_LIVE_CODEX"])
+    store = ReportStore(tmp_path / "reports")
+    server = await make_server(binary, "127.0.0.1", 0, store)
+    port = server.sockets[0].getsockname()[1]
+    try:
+        async with connect(f"ws://127.0.0.1:{port}", max_size=None) as ws:
+            await start_client(ws)
+            await ws.send(
+                json.dumps(
+                    {
+                        "id": 2,
+                        "method": "thread/start",
+                        "params": {
+                            "model": PROFILES[ProfileName.SOL].model,
+                            "cwd": str(tmp_path),
+                            "sandbox": "read-only",
+                            "approvalPolicy": "never",
+                        },
+                    }
+                )
+            )
+            started = await response(ws, 2)
+            thread = started["thread"]["id"]
+            original_effort = started["reasoningEffort"]
+            for request_id, prompt in (
+                (3, "l1~ Reply READY. Use no tools."),
+                (4, "Reply READY again. Use no tools."),
+            ):
+                await ws.send(
+                    json.dumps(
+                        {
+                            "id": request_id,
+                            "method": "turn/start",
+                            "params": {
+                                "threadId": thread,
+                                "input": [{"type": "text", "text": prompt}],
+                            },
+                        }
+                    )
+                )
+                await response(ws, request_id)
+                assert await complete_turn(ws) == 0
+    finally:
+        server.close()
+        await server.wait_closed()
+
+    report = store.latest()
+    assert [row["profile"] for row in report["responses"]] == ["luna", "sol"]
+    assert report["threadStates"][thread]["profile"] == "sol"
+    assert report["threadStates"][thread]["effort"] == original_effort
+    assert report["threadStates"][thread]["temporary_route"] is None
+    assert report["switches"][-1]["source"] == "temporary-directive-restore"
+
+
+@pytest.mark.asyncio
 async def test_real_cold_resume_restores_astra_and_can_switch_again(tmp_path):
     binary = Path(os.environ["ROUTER_LIVE_CODEX"])
     store = ReportStore(tmp_path / "reports")

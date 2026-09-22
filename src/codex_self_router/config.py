@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 import re
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import StrEnum
 from pathlib import Path
 from typing import Any
@@ -22,6 +23,9 @@ class SwitchApproval(StrEnum):
     ALWAYS = "always"
     UPGRADES_ONLY = "upgrades_only"
     NEVER = "never"
+
+
+EFFORT_RANK = {"low": 0, "medium": 1, "xhigh": 2}
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,8 +50,9 @@ class Profile:
 
 
 DEFAULT_ROUTING_POLICY_TEMPLATE = """\
-Model and reasoning routing is available through self_router.request_model_switch.
+Model and reasoning routing is managed by the self-router.
 
+{{agent_switching}}
 - At the start of each substantial phase, proactively choose both the model profile and reasoning
   effort that fit the upcoming work. You are responsible for requesting a change; do not wait for
   the user to suggest it.
@@ -83,13 +88,15 @@ Model and reasoning routing is available through self_router.request_model_switc
 - If the current model or effort is uncertain, request what the phase needs; exact same-target
   requests are no-ops.
 - A leading or trailing user directive ({{directives}}) is explicit authorization handled before
-  inference; do not repeat it with the tool.
+  inference; do not repeat it with the tool. A `~` suffix makes the directive temporary for that
+  task and restores the preceding route afterward.
 """
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "version": 1,
     "default_profile": "sol",
+    "agent_switching_enabled": True,
     "agent_switch_approval": "always",
     "routing_policy_template": DEFAULT_ROUTING_POLICY_TEMPLATE,
     "effort_levels": {"1": "low", "2": "medium", "3": "xhigh"},
@@ -158,6 +165,7 @@ PROFILES: dict[ProfileName, Profile] = {}
 DIRECTIVE_ROUTES: dict[str, tuple[ProfileName, str]] = {}
 DEFAULT_PROFILE = ProfileName.SOL
 AGENT_SWITCH_APPROVAL = SwitchApproval.ALWAYS
+AGENT_SWITCHING_ENABLED = True
 EFFORT_LEVELS: dict[str, str] = {}
 ROUTER_NAMESPACE = "self_router"
 ROUTER_TOOL = "request_model_switch"
@@ -182,11 +190,11 @@ def _mapping(value: Any, name: str) -> dict[str, Any]:
 def _price(value: Any, name: str) -> Price:
     data = _mapping(value, f"profiles.{name}.price")
     try:
-        numbers = {key: float(data[key]) for key in asdict(Price(0, 0, 0, 0))}
+        numbers = {field.name: float(data[field.name]) for field in fields(Price)}
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(f"invalid price for profile {name}: {exc}") from exc
-    if any(number < 0 for number in numbers.values()):
-        raise ValueError(f"prices for profile {name} must be non-negative")
+    if any(not math.isfinite(number) or number < 0 for number in numbers.values()):
+        raise ValueError(f"prices for profile {name} must be finite and non-negative")
     return Price(**numbers)
 
 
@@ -195,13 +203,24 @@ def _render_policy() -> str:
         f"- {name.value.title()} ({profile.model}): {profile.description}"
         for name, profile in PROFILES.items()
     )
-    directives = ", ".join(DIRECTIVE_ROUTES)
+    directives = ", ".join([*DIRECTIVE_ROUTES, *(f"{marker}~" for marker in DIRECTIVE_ROUTES)])
     replacements = {
+        "{{agent_switching}}": (
+            "- Agent-requested model and reasoning-effort switches are enabled."
+            if AGENT_SWITCHING_ENABLED
+            else (
+                "- Agent-requested model and reasoning-effort switches are disabled. Do not "
+                "attempt to change the route; only explicit user directives or manual client "
+                "changes can do so."
+            )
+        ),
         "{{approval_mode}}": AGENT_SWITCH_APPROVAL.value,
         "{{profiles}}": profile_lines,
         "{{directives}}": directives,
     }
     policy = ROUTING_POLICY_TEMPLATE
+    if not AGENT_SWITCHING_ENABLED and "{{agent_switching}}" not in policy:
+        policy = "{{agent_switching}}\n" + policy
     for marker, value in replacements.items():
         policy = policy.replace(marker, value)
     return policy
@@ -213,68 +232,67 @@ def _rebuild_contract() -> None:
     efforts = sorted(
         {effort for profile in PROFILES.values() for effort in profile.allowed_efforts}
     )
+    switch_tool = {
+        "type": "function",
+        "name": ROUTER_TOOL,
+        "description": (
+            "Proactively request the model and reasoning effort best suited to the next "
+            "substantial phase. Either targetProfile or targetReasoningEffort may be "
+            "omitted to keep its current value."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "targetProfile": {
+                    "type": "string",
+                    "enum": [name.value for name in PROFILES],
+                    "description": "Destination model profile; omit to keep the model.",
+                },
+                "targetReasoningEffort": {
+                    "type": "string",
+                    "enum": efforts,
+                    "description": "Destination effort; omit to use the profile default.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Why the next phase benefits from this route.",
+                },
+                "nextAction": {
+                    "type": "string",
+                    "description": "The first action to execute after the change.",
+                },
+                "estimatedFollowUpSteps": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Expected inference steps in the destination route.",
+                },
+            },
+            "required": ["reason", "nextAction", "estimatedFollowUpSteps"],
+            "anyOf": [
+                {"required": ["targetProfile"]},
+                {"required": ["targetReasoningEffort"]},
+            ],
+            "additionalProperties": False,
+        },
+    }
+    state_tool = {
+        "type": "function",
+        "name": ROUTER_STATE_TOOL,
+        "description": (
+            "Return the exact active router profile, model, reasoning effort, and "
+            "agent-switch configuration. This read-only call never changes state."
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {},
+            "additionalProperties": False,
+        },
+    }
     spec = {
         "type": "namespace",
         "name": ROUTER_NAMESPACE,
-        "description": "Request a model and/or reasoning-effort change.",
-        "tools": [
-            {
-                "type": "function",
-                "name": ROUTER_TOOL,
-                "description": (
-                    "Proactively request the model and reasoning effort best suited to the next "
-                    "substantial phase. Either targetProfile or targetReasoningEffort may be "
-                    "omitted to keep its current value."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "targetProfile": {
-                            "type": "string",
-                            "enum": [name.value for name in PROFILES],
-                            "description": "Destination model profile; omit to keep the model.",
-                        },
-                        "targetReasoningEffort": {
-                            "type": "string",
-                            "enum": efforts,
-                            "description": "Destination effort; omit to use the profile default.",
-                        },
-                        "reason": {
-                            "type": "string",
-                            "description": "Why the next phase benefits from this route.",
-                        },
-                        "nextAction": {
-                            "type": "string",
-                            "description": "The first action to execute after the change.",
-                        },
-                        "estimatedFollowUpSteps": {
-                            "type": "integer",
-                            "minimum": 1,
-                            "description": "Expected inference steps in the destination route.",
-                        },
-                    },
-                    "required": ["reason", "nextAction", "estimatedFollowUpSteps"],
-                    "anyOf": [
-                        {"required": ["targetProfile"]},
-                        {"required": ["targetReasoningEffort"]},
-                    ],
-                    "additionalProperties": False,
-                },
-            },
-            {
-                "type": "function",
-                "name": ROUTER_STATE_TOOL,
-                "description": (
-                    "Return the exact active router profile, model, reasoning effort, and "
-                    "agent-switch approval policy. This read-only call never changes state."
-                ),
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {},
-                    "additionalProperties": False,
-                },
-            },
-        ],
+        "description": "Inspect the active route and, when enabled, request route changes.",
+        "tools": [switch_tool, state_tool] if AGENT_SWITCHING_ENABLED else [state_tool],
     }
     ROUTING_TOOL_SPEC.clear()
     ROUTING_TOOL_SPEC.update(spec)
@@ -282,7 +300,7 @@ def _rebuild_contract() -> None:
 
 def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     global DEFAULT_PROFILE, AGENT_SWITCH_APPROVAL, EFFORT_LEVELS, ACTIVE_CONFIG_PATH
-    global ROUTING_POLICY_TEMPLATE
+    global AGENT_SWITCHING_ENABLED, ROUTING_POLICY_TEMPLATE
     if data.get("version") != 1:
         raise ValueError("config version must be 1")
     raw_profiles = _mapping(data.get("profiles"), "profiles")
@@ -323,7 +341,10 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
         for level, effort in levels.items():
             if effort not in profile.allowed_efforts:
                 raise ValueError(f"{name.value} does not allow effort {effort}")
-            routes[f"{profile.directive_prefix}{level}"] = (name, effort)
+            marker = f"{profile.directive_prefix}{level}"
+            if marker in routes:
+                raise ValueError(f"duplicate directive marker {marker}")
+            routes[marker] = (name, effort)
     for marker, raw in _mapping(data.get("legacy_directives", {}), "legacy_directives").items():
         route = _mapping(raw, f"legacy_directives.{marker}")
         try:
@@ -335,7 +356,10 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
             raise ValueError(f"legacy directive {marker} uses unsupported effort {effort}")
         if not marker or any(c.isspace() for c in marker):
             raise ValueError("directive markers cannot contain whitespace")
-        routes[str(marker)] = (name, effort)
+        marker = str(marker)
+        if marker in routes:
+            raise ValueError(f"duplicate directive marker {marker}")
+        routes[marker] = (name, effort)
     try:
         default = ProfileName(data.get("default_profile"))
     except ValueError as exc:
@@ -345,11 +369,15 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     except ValueError as exc:
         choices = ", ".join(mode.value for mode in SwitchApproval)
         raise ValueError(f"agent_switch_approval must be one of: {choices}") from exc
+    agent_switching = data.get("agent_switching_enabled", True)
+    if not isinstance(agent_switching, bool):
+        raise ValueError("agent_switching_enabled must be true or false")
     template = data.get("routing_policy_template", DEFAULT_ROUTING_POLICY_TEMPLATE)
     if not isinstance(template, str) or not template.strip():
         raise ValueError("routing_policy_template must be a non-empty string")
     unknown_markers = set(re.findall(r"{{[^{}]+}}", template)) - {
         "{{approval_mode}}",
+        "{{agent_switching}}",
         "{{profiles}}",
         "{{directives}}",
     }
@@ -363,6 +391,7 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     DIRECTIVE_ROUTES.update(routes)
     DEFAULT_PROFILE = default
     AGENT_SWITCH_APPROVAL = approval
+    AGENT_SWITCHING_ENABLED = agent_switching
     ROUTING_POLICY_TEMPLATE = template
     EFFORT_LEVELS = levels
     ACTIVE_CONFIG_PATH = path
@@ -398,6 +427,16 @@ def get_switch_approval() -> SwitchApproval:
     return AGENT_SWITCH_APPROVAL
 
 
+def get_agent_switching_enabled() -> bool:
+    return AGENT_SWITCHING_ENABLED
+
+
+def set_agent_switching_enabled(value: bool) -> None:
+    global AGENT_SWITCHING_ENABLED
+    AGENT_SWITCHING_ENABLED = value
+    _rebuild_contract()
+
+
 def set_switch_approval(value: SwitchApproval | str) -> None:
     global AGENT_SWITCH_APPROVAL
     AGENT_SWITCH_APPROVAL = SwitchApproval(value)
@@ -422,10 +461,9 @@ def switch_requires_approval(
         getattr(target_price, field) > getattr(previous_price, field)
         for field in asdict(previous_price)
     )
-    effort_order = list(dict.fromkeys(EFFORT_LEVELS.values()))
     try:
-        effort_upgrade = effort_order.index(target_effort) > effort_order.index(previous_effort)
-    except ValueError:
+        effort_upgrade = EFFORT_RANK[target_effort] > EFFORT_RANK[previous_effort]
+    except KeyError:
         effort_upgrade = target_effort != previous_effort
     return model_upgrade or effort_upgrade
 
@@ -434,6 +472,7 @@ def config_snapshot() -> dict[str, Any]:
     return {
         "path": str(ACTIVE_CONFIG_PATH) if ACTIVE_CONFIG_PATH else None,
         "defaultProfile": DEFAULT_PROFILE.value,
+        "agentSwitchingEnabled": AGENT_SWITCHING_ENABLED,
         "agentSwitchApproval": AGENT_SWITCH_APPROVAL.value,
         "routingPolicyTemplate": ROUTING_POLICY_TEMPLATE,
         "effortLevels": dict(EFFORT_LEVELS),
@@ -460,6 +499,7 @@ def routing_policy() -> str:
 def merge_routing_policy(instructions: str | None) -> str:
     base = instructions or ""
     markers = (
+        "Model and reasoning routing is managed by the self-router.",
         "Model and reasoning routing is available through self_router.request_model_switch.",
         "Model routing is available through self_router.request_model_switch.",
     )

@@ -1,9 +1,11 @@
 version: 1
 default_profile: sol
+agent_switching_enabled: true
 agent_switch_approval: always
 routing_policy_template: |
-  Model and reasoning routing is available through self_router.request_model_switch.
+  Model and reasoning routing is managed by the self-router.
 
+  {{agent_switching}}
   - At the start of each substantial phase, proactively choose both the model profile and reasoning
     effort that fit the upcoming work. You are responsible for requesting a change; do not wait for
     the user to suggest it.
@@ -39,7 +41,8 @@ routing_policy_template: |
   - If the current model or effort is uncertain, request what the phase needs; exact same-target
     requests are no-ops.
   - A leading or trailing user directive ({{directives}}) is explicit authorization handled before
-    inference; do not repeat it with the tool.
+    inference; do not repeat it with the tool. A `~` suffix makes the directive temporary for that
+    task and restores the preceding route afterward.
 effort_levels: {'1': low, '2': medium, '3': xhigh}
 legacy_directives:
   '#1': {profile: luna, effort: medium}

@@ -1,17 +1,63 @@
 # codex-self-router
 
-`codex-self-router` is a local WebSocket proxy for Codex. It lets a Codex agent request a model
-and/or reasoning-effort change during an active turn under a configurable approval policy, and it
-supports explicit per-instruction route directives without an extra approval round-trip.
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-The first release is intentionally a standalone proxy instead of a Codex fork:
+`codex-self-router` is an experimental local routing layer for Codex. It lets an agent change its
+model and reasoning effort between inference steps, under a configurable approval policy. Users
+can also select a route explicitly for one instruction or one task.
+
+Key capabilities:
+
+- agent-requested model and reasoning-effort changes;
+- explicit route directives such as `l1`, `s2`, or task-scoped `a3~`;
+- configurable approvals, including fully automatic or upgrades-only routing;
+- session resume and `/btw` thread-fork support;
+- per-response usage, route, latency, and API-equivalent cost reports;
+- fixed-model control runs for evaluating whether routing actually helps;
+- a kill switch for autonomous routing via YAML or `--disable-agent-switching`.
+
+> [!WARNING]
+> This project depends on experimental Codex app-server APIs. It is not an official OpenAI
+> project, and compatibility can break when Codex changes its protocol. Review the configuration
+> and use normal Codex sandbox and approval controls before relying on it for sensitive work.
+
+## Quick start
+
+Install directly from GitHub with [`uv`](https://docs.astral.sh/uv/):
+
+```sh
+uv tool install git+https://github.com/bartam1/codex-self-router.git
+codex-self-router init-config
+codex-self-router doctor
+```
+
+Start Codex through the router. Arguments after `--` are passed to Codex:
+
+```sh
+codex-self-router run -- \
+  --sandbox workspace-write \
+  --ask-for-approval on-request
+```
+
+Disable autonomous agent switching for one run while keeping explicit directives and `/model`:
+
+```sh
+codex-self-router run --disable-agent-switching -- \
+  --sandbox workspace-write \
+  --ask-for-approval on-request
+```
+
+## How it works
+
+The router is a standalone proxy, not a Codex fork:
 
 ```text
 Codex TUI  <-- WebSocket -->  codex-self-router  <-- JSONL/stdin -->  codex app-server
 ```
 
 It uses Codex app-server's experimental dynamic tools and `turn/settings/update` API. See the
-[official Codex app-server documentation](https://learn.chatgpt.com/docs/app-server).
+[official Codex app-server documentation](https://developers.openai.com/codex/app-server).
 
 ## Profiles and explicit directives
 
@@ -42,6 +88,16 @@ a3 design the concurrency boundary and implement it
 create another directory t1
 ```
 
+Append `~` to make a directive task-scoped. For example, `a2~` uses Astra/medium for the task and
+all router-generated continuations, then restores the route that was active beforehand. Completion,
+failure, or a user interruption restores the route; a router interruption does not because its
+continuation is part of the same task. A persistent directive or an explicit `/model` change cancels
+the pending restoration.
+
+```text
+a2~ design the authentication boundary, then return to my previous route
+```
+
 Markers in the middle of an instruction are ordinary text. The router removes an exact recognized
 leading or trailing token before sending the instruction to the model. Legacy `#1`, `#2`, and `#3`
 remain aliases for Luna/medium, Sol/medium, and Astra/xhigh respectively.
@@ -49,8 +105,9 @@ remain aliases for Luna/medium, Sol/medium, and Astra/xhigh respectively.
 These markers bypass approval because they are explicit user authorization. Model switches
 requested by the agent through `self_router.request_model_switch` follow the configured
 `agent_switch_approval` policy. The agent can change only effort while keeping the model.
-A marker also works when the instruction steers an already-running turn: the router applies
-`turn/settings/update` before forwarding the cleaned steering message.
+A marker, including its temporary `~` form, also works when the instruction steers an
+already-running turn: the router applies `turn/settings/update` before forwarding the cleaned
+steering message.
 
 ## Configuration
 
@@ -63,6 +120,20 @@ captured in new reports. See
 
 ```sh
 codex-self-router init-config
+```
+
+Set `agent_switching_enabled: false` to prevent agent-requested model and effort changes while
+keeping explicit user directives (`a2`, `l1~`, and so on), `/model`, and the read-only
+`self_router.get_current_route` tool available. New threads omit `request_model_switch`; resumed
+threads that persisted an older copy of the tool are also denied server-side. The setting defaults
+to `true`, and `agent_switch_approval` applies only while it is enabled.
+
+For a one-off process override, leave the YAML unchanged and pass the flag before or after the
+subcommand:
+
+```sh
+codex-self-router run --disable-agent-switching -- --sandbox danger-full-access
+codex-self-router --disable-agent-switching serve
 ```
 
 Configuration is validated at startup. Duplicate prefixes, unsupported configured effort mappings,
@@ -117,12 +188,14 @@ so it does not alter or visibly duplicate the user's message.
 The app-server APIs used here are experimental and can change between Codex releases. The router
 refuses older binaries by default instead of failing halfway through a session.
 
-## Install and run
+## Other installation and run modes
 
-With `uv`:
+Install a local checkout in editable mode for development:
 
 ```sh
-uv tool install .
+git clone https://github.com/bartam1/codex-self-router.git
+cd codex-self-router
+uv tool install --editable .
 codex-self-router doctor
 codex-self-router run
 ```
@@ -146,6 +219,10 @@ codex-self-router serve --listen 127.0.0.1:4501
 codex --remote ws://127.0.0.1:4501
 ```
 
+The `serve` endpoint has no router-level authentication. Keep the default loopback bind unless you
+have separately secured access to the host and port. A remote client receives the effective Codex
+permissions of the process you start.
+
 ### Resume a router session
 
 ```sh
@@ -168,10 +245,15 @@ tasks remain separate. Old reports retain their own pricing snapshots.
 
 Pending approvals and tool calls are **not** replayed. Resume restores conversation and routing
 state; it does not recover a running process or automatically continue unfinished work. Automatic
-reconnect and `thread/fork` are not supported. Ordinary non-router threads cannot gain the routing
-tool through resume. Older router reports provide best-effort profile restoration, but missing
-historical measurements are not reconstructed. Two router connections using the same report
-directory cannot own the same thread simultaneously.
+reconnect is not supported. Ordinary non-router threads cannot gain the routing tool through
+resume. Older router reports provide best-effort profile restoration, but missing historical
+measurements are not reconstructed. Two router connections using the same report directory cannot
+own the same thread simultaneously.
+
+`thread/fork` is supported for tracked router threads, including Codex side conversations opened
+with `/btw`. The fork inherits the source thread's active profile, reasoning effort, collaboration
+mode, developer instructions, and persisted routing tools. Parent and fork then have independent
+route state and can run concurrently; their lineage is recorded under `metadata.forkedThreads`.
 
 Codex 0.154.0 restores a thread's original dynamic-tool schema and cannot replace it during resume.
 Threads first created by router 0.3 can still resume and use model routing and all explicit 0.4
