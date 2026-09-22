@@ -157,6 +157,94 @@ def test_open_phase_and_following_user_task_do_not_contaminate_estimate(measured
     assert all(task["wallMs"] is None for task in result["tasks"])
 
 
+@pytest.mark.parametrize("item_type", ["collabToolCall", "collabAgentToolCall"])
+def test_delegation_and_routing_are_classified_without_storing_prompts(item_type):
+    events = []
+    observer = Measurements(events.append)
+    observer.start_turn("parent-thread", "parent-turn")
+    item = {
+        "type": item_type,
+        "id": "collab-1",
+        "tool": "spawn_agent",
+        "status": "completed",
+        "senderThreadId": "parent-thread",
+        "newThreadId": "child-thread",
+        "prompt": "private delegation prompt",
+    }
+    observer.observe(
+        {
+            "method": "item/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "turnId": "parent-turn",
+                "item": item,
+            },
+        }
+    )
+    observer.observe(
+        {
+            "method": "turn/completed",
+            "params": {
+                "threadId": "parent-thread",
+                "turn": {"id": "parent-turn", "status": "completed"},
+            },
+        }
+    )
+    report = SessionReport("delegation-session")
+    report.metadata = {"routerVersion": "0.7.0"}
+    report.measurements = observer.to_dict()
+    report.responses = [
+        UsageRecord(
+            "2026-01-01T00:00:00+00:00",
+            "parent-thread",
+            "parent-turn",
+            "parent-response",
+            "sol",
+            "model",
+            {"inputTokens": 100, "cachedInputTokens": 0, "outputTokens": 10},
+        ),
+        UsageRecord(
+            "2026-01-01T00:00:01+00:00",
+            "child-thread",
+            "child-turn",
+            "child-response",
+            "luna",
+            "model",
+            {"inputTokens": 50, "cachedInputTokens": 0, "outputTokens": 5},
+        ),
+    ]
+    report.switches = [
+        SwitchRecord(
+            "2026-01-01T00:00:00+00:00",
+            "parent-thread",
+            "parent-turn",
+            "luna",
+            "sol",
+            "agent-tool",
+            "applied",
+        )
+    ]
+
+    result = analyze(report.to_dict())
+    (task,) = result["tasks"]
+    assert task["routingDelegationClass"] == "both"
+    assert task["subagentDelegations"] == 1
+    assert task["subagentChildThreads"] == ["child-thread"]
+    assert task["subagentResponsesObserved"] == 1
+    assert task["pricedSubagentResponses"] == 1
+    assert task["subagentCostCoverage"] == "partial"
+    assert result["routingDelegation"]["classes"] == {
+        "neither": 0,
+        "router-only": 0,
+        "subagent-only": 0,
+        "both": 1,
+    }
+    assert result["routingDelegation"]["delegationIntentAttribution"] == (
+        "not-observable-without-prompt-inspection"
+    )
+    assert "private delegation prompt" not in json.dumps(report.measurements)
+
+
 def test_missing_usage_unknown_models_and_invalid_buckets_remain_unpriced():
     report = SessionReport("s")
     absent = usage()
@@ -177,7 +265,7 @@ def test_missing_usage_unknown_models_and_invalid_buckets_remain_unpriced():
 
 def test_aggregate_uses_original_prices_and_separates_control_cohorts(measured):
     report, _, _ = measured
-    report.metadata = {"label": "coding", "routingMode": "auto"}
+    report.metadata = {"label": "coding", "routingMode": "auto", "routerVersion": "0.7.0"}
     first = report.to_dict()
     first["feedback"] = {"turn-1": {"outcome": "rework", "tests": "failed"}}
     second = copy.deepcopy(first)
@@ -191,6 +279,8 @@ def test_aggregate_uses_original_prices_and_separates_control_cohorts(measured):
     assert auto["ratedTasks"] == 1
     assert fixed["knownCostUsd"] == pytest.approx(auto["knownCostUsd"] * 2)
     assert auto["meanAbsoluteStepEstimateError"] == 1
+    assert auto["routingDelegation"]["classes"]["router-only"] == 1
+    assert auto["routingDelegation"]["subagentDelegationFraction"] == 0
 
 
 @pytest.mark.asyncio
@@ -235,6 +325,17 @@ def test_legacy_reports_have_no_invented_tasks():
     assert result["groups"][0]["routingMode"] == "legacy"
     assert result["groups"][0]["tasks"] == 0
     assert result["groups"][0]["medianTaskWallMs"] is None
+
+
+def test_pre_0_7_tasks_are_not_misclassified_as_no_delegation(measured):
+    report, _, _ = measured
+    report.metadata = {"routerVersion": "0.6.1"}
+    summary = analyze(report.to_dict())["routingDelegation"]
+    assert summary["tasks"] == 1
+    assert summary["classifiedTasks"] == 0
+    assert summary["unclassifiedLegacyTasks"] == 1
+    assert summary["delegationObservationCoverage"] == "unavailable"
+    assert summary["subagentDelegationFraction"] is None
 
 
 def test_run_parses_switch_approval_override():

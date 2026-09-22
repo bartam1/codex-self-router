@@ -8,6 +8,7 @@ from websockets.asyncio.client import connect
 import codex_self_router.proxy as proxy_module
 from codex_self_router.cli import make_server
 from codex_self_router.config import PROFILES, ProfileName
+from codex_self_router.evaluation import analyze
 from codex_self_router.report import ReportStore
 
 FAKE_APP_SERVER = r"""#!/usr/bin/env python3
@@ -78,6 +79,11 @@ for line in sys.stdin:
                 "threadId": "thread-1", "turnId": "turn-1",
                 "item": {"type": "commandExecution", "id": "command-1", "status": "completed",
                          "exitCode": 0, "durationMs": 10, "aggregatedOutput": "not logged"}}},
+            {"method": "item/completed", "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "item": {"type": "collabToolCall", "id": "collab-1", "tool": "spawn_agent",
+                         "status": "completed", "senderThreadId": "thread-1",
+                         "newThreadId": "child-thread", "prompt": "not logged"}}},
             {"method": "turn/completed", "params": {
                 "threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}},
         ]:
@@ -198,6 +204,12 @@ async def test_websocket_proxy_injects_tools_and_applies_directive_to_first_infe
         await server.wait_closed()
     report = store.latest()
     assert report["endedAt"] is not None
+    collab = next(item for item in report["measurements"]["items"] if item["item_id"] == "collab-1")
+    assert collab["is_subagent_delegation"] is True
+    assert collab["new_thread_id"] == "child-thread"
+    assert "not logged" not in json.dumps(report["measurements"])
+    (task,) = analyze(report)["tasks"]
+    assert task["routingDelegationClass"] == ("both" if fixed_profile is None else "subagent-only")
     assert report["schemaVersion"] == 2
     assert report["metadata"]["label"] == "integration"
     assert report["responses"][0]["profile"] == expected.value

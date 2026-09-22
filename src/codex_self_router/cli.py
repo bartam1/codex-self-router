@@ -267,12 +267,22 @@ def print_report(data: dict[str, Any], as_json: bool) -> int:
         f"Usage coverage: {analysis['usage']['pricedResponses']}/{len(responses)} priced; "
         f"reasoning reported for {analysis['usage']['reasoningUsageReportedResponses']}"
     )
+    routing_delegation = analysis["routingDelegation"]
+    classes = routing_delegation["classes"]
+    print(
+        "Routing/delegation: "
+        + ", ".join(f"{name}={count}" for name, count in classes.items())
+        + f"; observation coverage={routing_delegation['delegationObservationCoverage']}"
+        + f"; subagent cost coverage={routing_delegation['subagentCostCoverage']}"
+    )
     for task in analysis["tasks"]:
         seconds = f"{task['wallMs'] / 1000:.1f}s" if task["wallMs"] is not None else "open/unknown"
         outcome = (task.get("feedback") or {}).get("outcome", "unrated")
         print(
             f"Task {task['taskId']}: {task['responses']} responses, {seconds}, "
-            f"status={task['status']}, outcome={outcome}, failed tools={task['failedToolItems']}"
+            f"status={task['status']}, outcome={outcome}, "
+            f"routing/delegation={task['routingDelegationClass']}, "
+            f"failed tools={task['failedToolItems']}"
         )
     for phase in analysis["phases"]:
         print(
@@ -327,6 +337,30 @@ async def async_main(args: argparse.Namespace) -> int:
                         f"known cost=${group['knownCostUsd']:.6f}, "
                         f"unpriced responses={group['unpricedResponses']}, "
                         f"outcomes={group['taskOutcomes']}"
+                    )
+                    routing_delegation = group["routingDelegation"]
+                    classes = routing_delegation["classes"]
+                    print(
+                        "  routing/delegation: "
+                        + ", ".join(f"{name}={count}" for name, count in classes.items())
+                        + "; classified="
+                        + f"{routing_delegation['classifiedTasks']}/{routing_delegation['tasks']}"
+                        + "; observation coverage="
+                        + routing_delegation["delegationObservationCoverage"]
+                        + "; delegation rate="
+                        + (
+                            f"{routing_delegation['subagentDelegationFraction']:.1%}"
+                            if routing_delegation["subagentDelegationFraction"] is not None
+                            else "n/a"
+                        )
+                        + "; router participation="
+                        + (
+                            f"{routing_delegation['routerParticipationFraction']:.1%}"
+                            if routing_delegation["routerParticipationFraction"] is not None
+                            else "n/a"
+                        )
+                        + f"; subagent cost coverage="
+                        f"{routing_delegation['subagentCostCoverage']}"
                     )
                 print("Observed cohorts; compare task mix and quality before claiming savings.")
             return 0

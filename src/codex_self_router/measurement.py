@@ -14,8 +14,30 @@ TOOL_ITEMS = {
     "dynamicToolCall",
     "fileChange",
     "webSearch",
+    "collabToolCall",
     "collabAgentToolCall",
 }
+COLLAB_ITEM_TYPES = {"collabToolCall", "collabAgentToolCall"}
+
+
+def _collaboration_fields(item: dict[str, Any]) -> dict[str, Any]:
+    if item.get("type") not in COLLAB_ITEM_TYPES:
+        return {}
+    tool = item.get("tool")
+    new_thread_id = item.get("newThreadId")
+    receiver_thread_id = item.get("receiverThreadId")
+    normalized_tool = str(tool or "").replace("-", "_").lower()
+    return {
+        "collaboration_tool": tool,
+        "sender_thread_id": item.get("senderThreadId"),
+        "receiver_thread_id": receiver_thread_id,
+        "new_thread_id": new_thread_id,
+        "is_subagent_delegation": bool(
+            new_thread_id
+            or item.get("type") == "collabAgentToolCall"
+            or normalized_tool in {"spawn", "spawn_agent", "spawnagent", "create_agent"}
+        ),
+    }
 
 
 class Measurements:
@@ -107,6 +129,7 @@ class Measurements:
             record = self.items.get(key)
             if record is not None and record.get("end_ms") is not None:
                 return
+            collaboration = _collaboration_fields(item)
             event = self.event(
                 "item_started" if method == "item/started" else "item_completed",
                 thread_id=thread_id,
@@ -117,6 +140,7 @@ class Measurements:
                 exit_code=item.get("exitCode"),
                 success=item.get("success"),
                 duration_ms=item.get("durationMs"),
+                **collaboration,
             )
             if record is None:
                 record = {
@@ -126,6 +150,7 @@ class Measurements:
                     "item_type": kind,
                     "start_ms": None,
                     "end_ms": None,
+                    **collaboration,
                 }
                 self.items[key] = record
             if method == "item/started":
@@ -142,6 +167,7 @@ class Measurements:
                         or item.get("success") is False
                         or item.get("exitCode") not in {None, 0}
                     ),
+                    **collaboration,
                 )
         elif method == "error":
             self.event(

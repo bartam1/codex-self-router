@@ -2,11 +2,79 @@
 
 from __future__ import annotations
 
+import re
 from collections import Counter, defaultdict
 from statistics import mean, median
 from typing import Any
 
 from .report import parse_timestamp, usage_cost
+
+ROUTING_DELEGATION_CLASSES = ("neither", "router-only", "subagent-only", "both")
+
+
+def routing_delegation_class(routing: bool, delegation: bool) -> str:
+    if routing and delegation:
+        return "both"
+    if routing:
+        return "router-only"
+    if delegation:
+        return "subagent-only"
+    return "neither"
+
+
+def routing_delegation_summary(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    primary = [task for task in tasks if not task.get("isSubagentTask")]
+    classified = [
+        task for task in primary if task.get("delegationObservationCoverage") != "unavailable"
+    ]
+    classes = Counter(task["routingDelegationClass"] for task in classified)
+    total = len(classified)
+    routing = sum(bool(task["routerParticipationObserved"]) for task in classified)
+    delegation = sum(bool(task["subagentDelegationObserved"]) for task in classified)
+    observation_coverage = (
+        "not-applicable"
+        if not primary
+        else (
+            "unavailable"
+            if not classified
+            else (
+                "complete"
+                if all(task["delegationObservationCoverage"] == "complete" for task in classified)
+                and len(classified) == len(primary)
+                else "partial"
+            )
+        )
+    )
+    return {
+        "tasks": len(primary),
+        "classifiedTasks": total,
+        "unclassifiedLegacyTasks": len(primary) - total,
+        "delegationObservationCoverage": observation_coverage,
+        "classes": {name: classes[name] for name in ROUTING_DELEGATION_CLASSES},
+        "routerParticipationTasks": routing,
+        "routerParticipationFraction": routing / total if total else None,
+        "subagentDelegationTasks": delegation,
+        "subagentDelegationFraction": delegation / total if total else None,
+        "subagentDelegations": sum(task["subagentDelegations"] for task in classified),
+        "subagentResponsesObserved": sum(task["subagentResponsesObserved"] for task in classified),
+        "pricedSubagentResponses": sum(task["pricedSubagentResponses"] for task in classified),
+        "delegationIntentAttribution": "not-observable-without-prompt-inspection",
+        "subagentCostCoverage": (
+            "not-applicable"
+            if not delegation
+            else (
+                "partial"
+                if any(task["pricedSubagentResponses"] for task in classified)
+                else "unavailable"
+            )
+        ),
+    }
+
+
+def supports_delegation_observation(data: dict[str, Any]) -> bool:
+    version = str(data.get("metadata", {}).get("routerVersion", ""))
+    numbers = [int(part) for part in re.findall(r"\d+", version)[:3]]
+    return tuple(numbers + [0] * (3 - len(numbers))) >= (0, 7, 0)
 
 
 def interval_union_ms(intervals: list[tuple[float, float]]) -> float:
@@ -58,6 +126,21 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
     responses = data.get("responses", [])
     prices = data.get("pricingUsdPerMillionTokens", {})
     switches = data.get("switches", [])
+    delegation_observation_supported = supports_delegation_observation(data)
+    measurement_items = measurements.get("items", [])
+
+    def is_delegation(item: dict) -> bool:
+        if item.get("is_subagent_delegation") is not None:
+            return item.get("is_subagent_delegation") is True
+        return item.get("item_type") == "collabAgentToolCall"
+
+    delegation_items = [item for item in measurement_items if is_delegation(item)]
+    child_thread_ids = {
+        str(thread_id)
+        for item in delegation_items
+        for thread_id in (item.get("new_thread_id"), item.get("receiver_thread_id"))
+        if thread_id
+    }
     tasks: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for turn in turns:
         tasks[(turn["thread_id"], turn["task_id"])].append(turn)
@@ -89,7 +172,28 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
             else []
         )
         wait_ms = interval_union_ms(intervals) if end is not None else None
-        items = [i for i in measurements.get("items", []) if task_for(i) == task_key]
+        items = [i for i in measurement_items if task_for(i) == task_key]
+        delegations = [item for item in items if is_delegation(item)]
+        task_child_threads = sorted(
+            {
+                str(thread_id)
+                for item in delegations
+                for thread_id in (item.get("new_thread_id"), item.get("receiver_thread_id"))
+                if thread_id
+            }
+        )
+        subagent_responses = [
+            response for response in responses if response.get("thread_id") in task_child_threads
+        ]
+        priced_subagent_responses = sum(
+            usage_cost(response.get("usage"), prices.get(response.get("profile"))) is not None
+            for response in subagent_responses
+        )
+        router_participation = any(
+            switch.get("outcome") == "applied" and task_for(switch) == task_key
+            for switch in switches
+        )
+        delegation_observed = bool(delegations)
         errors = [
             e
             for e in measurements.get("events", [])
@@ -123,6 +227,24 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
                 else None,
                 "toolItems": len(items),
                 "failedToolItems": sum(bool(i.get("failed")) for i in items),
+                "isSubagentTask": task_key[0] in child_thread_ids,
+                "delegationObservationCoverage": (
+                    "complete" if delegation_observation_supported else "unavailable"
+                ),
+                "routerParticipationObserved": router_participation,
+                "subagentDelegationObserved": delegation_observed,
+                "routingDelegationClass": routing_delegation_class(
+                    router_participation, delegation_observed
+                ),
+                "subagentDelegations": len(delegations),
+                "subagentChildThreads": task_child_threads,
+                "subagentResponsesObserved": len(subagent_responses),
+                "pricedSubagentResponses": priced_subagent_responses,
+                "subagentCostCoverage": (
+                    "not-applicable"
+                    if not delegations
+                    else ("partial" if priced_subagent_responses else "unavailable")
+                ),
                 "upstreamErrors": len(errors),
                 "announcedRetries": sum(e.get("will_retry") is True for e in errors),
                 "userSteers": sum(e.get("method") == "turn/steer" for e in interactions),
@@ -228,6 +350,7 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
         )
         for profile in {r.get("profile") for r in responses}
     }
+    routing_delegation = routing_delegation_summary(task_summaries)
     return {
         "coverage": {
             "schemaVersion": data.get("schemaVersion", 1),
@@ -238,6 +361,7 @@ def analyze(data: dict[str, Any]) -> dict[str, Any]:
         "usage": response_summary(responses, prices),
         "byProfile": by_profile,
         "switchOutcomes": dict(Counter(s.get("outcome", "unknown") for s in switches)),
+        "routingDelegation": routing_delegation,
         "tasks": task_summaries,
         "phases": phases,
     }
@@ -273,8 +397,35 @@ def aggregate(reports: list[dict[str, Any]]) -> dict[str, Any]:
                 "unpricedResponses",
                 "failedToolItems",
                 "announcedRetries",
+                "subagentDelegations",
+                "subagentResponsesObserved",
+                "pricedSubagentResponses",
             ):
                 combined[field] = sum(p[field] for p in parts)
+            combined["routerParticipationObserved"] = any(
+                p["routerParticipationObserved"] for p in parts
+            )
+            combined["subagentDelegationObserved"] = any(
+                p["subagentDelegationObserved"] for p in parts
+            )
+            combined["routingDelegationClass"] = routing_delegation_class(
+                combined["routerParticipationObserved"],
+                combined["subagentDelegationObserved"],
+            )
+            combined["subagentChildThreads"] = sorted(
+                {thread for part in parts for thread in part["subagentChildThreads"]}
+            )
+            combined["subagentCostCoverage"] = (
+                "not-applicable"
+                if not combined["subagentDelegations"]
+                else ("partial" if combined["pricedSubagentResponses"] else "unavailable")
+            )
+            coverages = {part["delegationObservationCoverage"] for part in parts}
+            combined["delegationObservationCoverage"] = (
+                "complete"
+                if coverages == {"complete"}
+                else ("unavailable" if coverages == {"unavailable"} else "partial")
+            )
             # Reconnect gaps and unfinished fragments are not measured task latency.
             combined["wallMs"] = None
             combined["feedback"] = max(
@@ -291,6 +442,7 @@ def aggregate(reports: list[dict[str, Any]]) -> dict[str, Any]:
             t for t in tasks if t["closed"] and t["responses"] > 0 and t["unpricedResponses"] == 0
         ]
         success_count = sum(f.get("outcome") == "success" for f in feedback)
+        routing_delegation = routing_delegation_summary(tasks)
         rows.append(
             {
                 "label": label,
@@ -327,6 +479,7 @@ def aggregate(reports: list[dict[str, Any]]) -> dict[str, Any]:
                         s.get("outcome", "unknown") for run in runs for s in run.get("switches", [])
                     )
                 ),
+                "routingDelegation": routing_delegation,
                 "failedToolItems": sum(t["failedToolItems"] for t in tasks),
                 "announcedRetries": sum(t["announcedRetries"] for t in tasks),
                 "approvalMs": sum(
@@ -348,5 +501,8 @@ def aggregate(reports: list[dict[str, Any]]) -> dict[str, Any]:
             "Costs use each session's pricing snapshot; missing usage is excluded and counted.",
             "Open tasks are excluded from duration and step-estimate accuracy statistics.",
             "Task and test outcomes come from explicit feedback; unrated tasks remain unknown.",
+            "Delegation intent is not inferred because reports intentionally do not store prompts.",
+            "Subagent cost coverage is partial or unavailable unless child response usage and "
+            "model attribution are both observed.",
         ],
     }

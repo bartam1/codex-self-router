@@ -279,10 +279,23 @@ Reports contain:
 - response-level token usage and model attribution;
 - an API-equivalent routed cost estimate;
 - comparisons with the same observed tokens priced as all-Sol and all-Astra;
+- passive per-task routing/delegation classification (`neither`, `router-only`,
+  `subagent-only`, or `both`) from Codex collaboration lifecycle events;
 - the exact per-million-token pricing snapshot used by that report.
 
 The estimates are not ChatGPT subscription charges and are not true counterfactual runs. A
 different model can take a different number of steps and tokens.
+
+Delegation reports store collaboration tool names and parent/child thread IDs, but never delegation
+prompts. Because the app-server may not expose every child response with independently attributable
+model usage, subagent cost coverage is reported as `partial` or `unavailable`, never silently
+treated as complete. The protocol also cannot distinguish spontaneous delegation from a user's
+explicit delegation request without inspecting prompt text, so delegation intent remains
+unattributed.
+
+Delegation classification starts with reports created by router 0.7. Earlier reports cannot
+reconstruct collaboration events that were not recorded, so aggregate output excludes their tasks
+from the four-category matrix and labels their observation coverage as unavailable.
 
 On macOS reports default to:
 
