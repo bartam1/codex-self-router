@@ -162,9 +162,6 @@ async def test_astra_survives_restart_with_tool_policy_and_measurement_lineage(t
                 "callId": "call-1",
                 "arguments": {
                     "targetProfile": "astra",
-                    "reason": "design",
-                    "nextAction": "plan",
-                    "estimatedFollowUpSteps": 4,
                 },
             },
         }

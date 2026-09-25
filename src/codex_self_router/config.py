@@ -253,21 +253,7 @@ def _rebuild_contract() -> None:
                     "enum": efforts,
                     "description": "Destination effort; omit to use the profile default.",
                 },
-                "reason": {
-                    "type": "string",
-                    "description": "Why the next phase benefits from this route.",
-                },
-                "nextAction": {
-                    "type": "string",
-                    "description": "The first action to execute after the change.",
-                },
-                "estimatedFollowUpSteps": {
-                    "type": "integer",
-                    "minimum": 1,
-                    "description": "Expected inference steps in the destination route.",
-                },
             },
-            "required": ["reason", "nextAction", "estimatedFollowUpSteps"],
             "anyOf": [
                 {"required": ["targetProfile"]},
                 {"required": ["targetReasoningEffort"]},

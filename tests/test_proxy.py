@@ -46,9 +46,6 @@ def switch_request(request_id: str = "server-1") -> dict:
             "tool": "request_model_switch",
             "arguments": {
                 "targetProfile": "astra",
-                "reason": "architecture phase",
-                "nextAction": "design the boundary",
-                "estimatedFollowUpSteps": 4,
             },
         },
     }
@@ -380,7 +377,7 @@ async def test_incompatible_agent_switch_continues_in_new_turn(tmp_path) -> None
     assert "not a user cancellation" in continuation_output
     assert "request_user_input_async" in continuation_output
     assert "Make and state reasonable assumptions" in continuation_output
-    assert "design the boundary" in continuation_output
+    assert "continue immediately" in continuation_output
     assert continuation["model"] == PROFILES[ProfileName.ASTRA].model
     assert continuation["collaborationMode"]["settings"] == {
         "model": PROFILES[ProfileName.ASTRA].model,
@@ -617,9 +614,6 @@ async def test_approval_response_is_intercepted_and_resolved(tmp_path) -> None:
             previous_effort="medium",
             target=ProfileName.ASTRA,
             target_effort="xhigh",
-            reason="hard problem",
-            next_action="solve it",
-            steps=3,
         )
     )
     await asyncio.sleep(0)

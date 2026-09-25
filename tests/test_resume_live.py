@@ -21,9 +21,8 @@ pytestmark = pytest.mark.skipif(
 )
 SWITCH_PROMPT = (
     "This is an authorized router smoke test. Call self_router.request_model_switch "
-    "with targetProfile luna, targetReasoningEffort low, reason 'resume smoke test', "
-    "nextAction 'Reply READY', "
-    "and estimatedFollowUpSteps 1. After approval reply READY. Do nothing else."
+    "with targetProfile luna and targetReasoningEffort low. After approval reply READY. "
+    "Do nothing else."
 )
 
 

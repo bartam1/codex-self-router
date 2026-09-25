@@ -308,7 +308,8 @@ def test_thread_start_merges_router_tool_and_policy() -> None:
     assert "Proactively request" in router_tool["description"]
     schema = router_tool["inputSchema"]
     assert schema["properties"]["targetReasoningEffort"]["enum"] == ["low", "medium", "xhigh"]
-    assert "targetProfile" not in schema["required"]
+    assert "required" not in schema
+    assert set(schema["properties"]) == {"targetProfile", "targetReasoningEffort"}
 
 
 def test_thread_start_replaces_stale_router_namespace() -> None:

@@ -378,9 +378,9 @@ cache hits, or steps. Fixed-model cohorts are observed comparisons, but differen
 unrated results can still bias them. No automatic causal savings claim or confidence score is made.
 
 The new event journal stores selected protocol metadata, not prompt text, command arguments/output,
-or reasoning text. Existing switch reasons/next actions, upstream usage metadata, and explicit
-feedback notes are still saved locally. A journal survives between snapshot saves; a hard crash
-may leave an incomplete session, which is excluded from closed-task timing statistics.
+or reasoning text. Upstream usage metadata and explicit feedback notes are still saved locally. A
+journal survives between snapshot saves; a hard crash may leave an incomplete session, which is
+excluded from closed-task timing statistics.
 Resume checkpoints in the JSON reports also retain developer instructions and collaboration-mode
 settings so they can be restored. Treat the report directory as private session data.
 
@@ -404,6 +404,9 @@ settings so they can be restored. Treat the report directory as private session 
   more capable than the upcoming work needs. Routing decisions count expected model inference
   steps: a single shell action commonly requires one response to invoke the tool and another to
   process its result, so it can still justify moving from Astra to Luna.
+- `self_router.request_model_switch` accepts only `targetProfile` and/or
+  `targetReasoningEffort`; at least one is required. The router preserves the existing task
+  context and records no model-supplied rationale or step estimate.
 - Exact same-model/same-effort tool requests are no-ops and do not ask for approval.
 - Only one agent-requested switch is processed at a time for a turn.
 - Other tool calls from the same model response remain independent.
@@ -418,8 +421,8 @@ settings so they can be restored. Treat the report directory as private session 
 - Codex rejects some in-turn switches when the two models require different safety settings. For
   those combinations, including some GPT-5.6-to-Astra transitions in Codex 0.154.0, the router interrupts the
   current turn and immediately starts a model-switched continuation turn in the same thread. It
-  passes the approved next action as standalone tool output, preserving conversation context while
-  letting the destination model start with its required safety configuration. The continuation
+  passes a router-generated continuation notice as standalone tool output, preserving conversation
+  context while letting the destination model start with its required safety configuration. The continuation
   explicitly tells the destination model that this mechanical boundary is not a new request or a
   user cancellation, and that it should make reasonable assumptions rather than queue optional
   clarification questions merely because the turn changed. As a deterministic fallback, the

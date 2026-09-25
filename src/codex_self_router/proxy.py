@@ -55,7 +55,6 @@ def _continuation_tool_output(
     previous_effort: str,
     target: ProfileName,
     target_effort: str,
-    next_action: str,
 ) -> str:
     return (
         "Model/effort switch authorized and applied: "
@@ -63,7 +62,7 @@ def _continuation_tool_output(
         "This is an automatic continuation of the existing user instruction, not a new request. "
         "The preceding interruption was only the router creating a safety-compatible turn "
         "boundary; it was not a user cancellation. Preserve and use the full conversation "
-        f"context, and continue immediately with: {next_action}\n\n"
+        "context, then continue immediately.\n\n"
         "Do not call request_user_input or request_user_input_async for optional clarification "
         "in this continuation. Make and state reasonable assumptions, then complete the requested "
         "work. Ask a question only if a missing answer genuinely prevents safe or correct progress."
@@ -278,9 +277,6 @@ class Bridge:
                         ProfileName(switch.from_profile),
                         ProfileName(switch.to_profile),
                         "cancelled",
-                        switch.reason or "",
-                        switch.next_action or "",
-                        switch.estimated_follow_up_steps or 0,
                         detail="Session ended before the routing decision completed.",
                         origin_turn_id=switch.origin_turn_id,
                     )
@@ -1391,9 +1387,7 @@ class Bridge:
             try:
                 previous = state.profile
                 previous_effort = state.effort or PROFILES[previous].effort
-                target, target_effort, reason, next_action, steps = parse_switch_arguments(
-                    params, previous, previous_effort
-                )
+                target, target_effort = parse_switch_arguments(params, previous, previous_effort)
             except ValueError as exc:
                 await self._send_upstream(_tool_result(request_id, str(exc), success=False))
                 return
@@ -1407,9 +1401,6 @@ class Bridge:
                 to_profile=target.value,
                 source="agent-tool",
                 outcome="pending",
-                reason=reason,
-                next_action=next_action,
-                estimated_follow_up_steps=steps,
                 switch_id=str(uuid.uuid4()),
                 requested_at=utc_now(),
                 from_effort=previous_effort,
@@ -1435,7 +1426,6 @@ class Bridge:
                 to_profile=target.value,
                 from_effort=previous_effort,
                 to_effort=target_effort,
-                estimated_steps=steps,
                 approval_policy=self.switch_approval.value,
                 approval_required=approval_required,
             )
@@ -1444,9 +1434,7 @@ class Bridge:
                 switch.approval_required = False
                 switch.authorization = "not-needed"
                 switch.approval_ms = 0.0
-                self._record_agent_switch(
-                    thread_id, turn_id, previous, target, "noop", reason, next_action, steps
-                )
+                self._record_agent_switch(thread_id, turn_id, previous, target, "noop")
                 await self._send_upstream(
                     _tool_result(
                         request_id,
@@ -1466,9 +1454,6 @@ class Bridge:
                     previous_effort=previous_effort,
                     target=target,
                     target_effort=target_effort,
-                    reason=reason,
-                    next_action=next_action,
-                    steps=steps,
                 )
                 switch.approval_ms = round((time.monotonic() - approval_started) * 1000, 3)
                 switch.authorization = "user-approved" if approved else "user-denied"
@@ -1483,9 +1468,6 @@ class Bridge:
                     previous,
                     target,
                     "denied",
-                    reason,
-                    next_action,
-                    steps,
                 )
                 await self._send_upstream(
                     _tool_result(
@@ -1506,9 +1488,6 @@ class Bridge:
                     previous,
                     target,
                     "failed",
-                    reason,
-                    next_action,
-                    steps,
                     detail=str(exc),
                 )
                 await self._send_upstream(_tool_result(request_id, str(exc), success=False))
@@ -1550,7 +1529,6 @@ class Bridge:
                                 previous_effort=previous_effort,
                                 target=target,
                                 target_effort=target_effort,
-                                next_action=next_action,
                             )
                         except Exception as exc:
                             self._record_agent_switch(
@@ -1559,9 +1537,6 @@ class Bridge:
                                 previous,
                                 target,
                                 "failed",
-                                reason,
-                                next_action,
-                                steps,
                                 detail=str(exc),
                             )
                             await self._send_client(
@@ -1579,9 +1554,6 @@ class Bridge:
                             previous,
                             target,
                             "applied",
-                            reason,
-                            next_action,
-                            steps,
                             detail=(
                                 "Continued in a fresh turn because Codex rejected an in-turn "
                                 f"settings update: {detail}"
@@ -1601,9 +1573,6 @@ class Bridge:
                     previous,
                     target,
                     "failed",
-                    reason,
-                    next_action,
-                    steps,
                     detail=str(exc),
                 )
                 await self._send_upstream(
@@ -1619,9 +1588,6 @@ class Bridge:
                 previous,
                 target,
                 "applied",
-                reason,
-                next_action,
-                steps,
             )
             await self._notify_active_route(thread_id, target, target_effort)
             await self._send_upstream(
@@ -1629,8 +1595,7 @@ class Bridge:
                     request_id,
                     (
                         f"Switched from {previous.value}/{previous_effort} "
-                        f"to {target.value}/{target_effort}. "
-                        f"Continue now with: {next_action}"
+                        f"to {target.value}/{target_effort}. Continue the current task."
                     ),
                     success=True,
                 )
@@ -1645,7 +1610,6 @@ class Bridge:
         previous_effort: str,
         target: ProfileName,
         target_effort: str,
-        next_action: str,
     ) -> str:
         key = (thread_id, turn_id)
         if key in self.turn_completion_waiters:
@@ -1675,7 +1639,7 @@ class Bridge:
                 "name": "request_model_switch",
                 "namespace": "self_router",
                 "output": _continuation_tool_output(
-                    previous, previous_effort, target, target_effort, next_action
+                    previous, previous_effort, target, target_effort
                 ),
             },
             "model": profile.model,
@@ -1722,9 +1686,6 @@ class Bridge:
         previous_effort: str,
         target: ProfileName,
         target_effort: str,
-        reason: str,
-        next_action: str,
-        steps: int,
     ) -> bool:
         approval_id = f"self-router-approval-{uuid.uuid4()}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -1745,9 +1706,7 @@ class Bridge:
                             "header": "Model switch",
                             "question": (
                                 f"Switch {previous.value}/{previous_effort} → "
-                                f"{target.value}/{target_effort}?\n"
-                                f"Reason: {reason}\nNext: {next_action}\n"
-                                f"Estimated follow-up steps: {steps}"
+                                f"{target.value}/{target_effort}?"
                             ),
                             "isOther": False,
                             "isSecret": False,
@@ -1866,9 +1825,6 @@ class Bridge:
         previous: ProfileName,
         target: ProfileName,
         outcome: str,
-        reason: str,
-        next_action: str,
-        steps: int,
         *,
         detail: str | None = None,
         origin_turn_id: str | None = None,
@@ -1895,9 +1851,6 @@ class Bridge:
                 to_profile=target.value,
                 source="agent-tool",
                 outcome=outcome,
-                reason=reason,
-                next_action=next_action,
-                estimated_follow_up_steps=steps,
                 detail=detail,
                 from_effort=current_effort,
                 to_effort=PROFILES[target].effort,
