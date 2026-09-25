@@ -238,7 +238,8 @@ def _rebuild_contract() -> None:
         "description": (
             "Proactively request the model and reasoning effort best suited to the next "
             "substantial phase. Either targetProfile or targetReasoningEffort may be "
-            "omitted to keep its current value."
+            "omitted to keep its current value. Profiles are luna, terra, sol, or astra; "
+            "reasoning efforts are low, medium, or xhigh."
         ),
         "inputSchema": {
             "type": "object",
@@ -246,7 +247,10 @@ def _rebuild_contract() -> None:
                 "targetProfile": {
                     "type": "string",
                     "enum": [name.value for name in PROFILES],
-                    "description": "Destination model profile; omit to keep the model.",
+                    "description": (
+                        "Destination model profile: luna, terra, sol, or astra; omit to "
+                        "keep the current model."
+                    ),
                 },
                 "targetReasoningEffort": {
                     "type": "string",

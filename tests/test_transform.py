@@ -6,6 +6,7 @@ from codex_self_router.config import PROFILES, ROUTER_NAMESPACE, ROUTING_POLICY,
 from codex_self_router.transform import (
     enable_experimental_api,
     parse_directive,
+    parse_switch_arguments,
     prepare_thread_start,
     prepare_turn_start,
     prepare_turn_steer,
@@ -42,6 +43,14 @@ def test_fixed_control_has_no_router_tool_and_enforces_model() -> None:
         prepare_turn_start(
             {"params": {"input": [{"type": "text", "text": "#3 plan"}]}}, ProfileName.SOL
         )
+
+
+def test_switch_arguments_accept_case_insensitive_profile_and_effort() -> None:
+    assert parse_switch_arguments(
+        {"arguments": {"targetProfile": "Terra", "targetReasoningEffort": "LOW"}},
+        ProfileName.SOL,
+        "medium",
+    ) == (ProfileName.TERRA, "low")
 
 
 def test_directives_are_recognized_as_first_or_final_token() -> None:

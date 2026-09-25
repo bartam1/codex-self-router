@@ -218,8 +218,16 @@ def parse_switch_arguments(
         raw_effort = arguments.get("targetReasoningEffort")
         if raw_profile is None and raw_effort is None:
             raise ValueError("targetProfile or targetReasoningEffort is required")
-        target = ProfileName(raw_profile) if raw_profile is not None else current_profile
-        effort = str(raw_effort) if raw_effort is not None else PROFILES[target].effort
+        target = (
+            ProfileName(str(raw_profile).strip().lower())
+            if raw_profile is not None
+            else current_profile
+        )
+        effort = (
+            str(raw_effort).strip().lower()
+            if raw_effort is not None
+            else PROFILES[target].effort
+        )
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid switch arguments: {exc}") from exc
     if effort not in PROFILES[target].allowed_efforts:
