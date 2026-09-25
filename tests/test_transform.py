@@ -50,7 +50,7 @@ def test_switch_arguments_accept_case_insensitive_profile_and_effort() -> None:
         {"arguments": {"targetProfile": "Terra", "targetReasoningEffort": "LOW"}},
         ProfileName.SOL,
         "medium",
-    ) == (ProfileName.TERRA, "low")
+    ) == (ProfileName.TERRA, "low", None)
 
 
 def test_directives_are_recognized_as_first_or_final_token() -> None:
@@ -318,7 +318,11 @@ def test_thread_start_merges_router_tool_and_policy() -> None:
     schema = router_tool["inputSchema"]
     assert schema["properties"]["targetReasoningEffort"]["enum"] == ["low", "medium", "xhigh"]
     assert "required" not in schema
-    assert set(schema["properties"]) == {"targetProfile", "targetReasoningEffort"}
+    assert set(schema["properties"]) == {
+        "targetProfile",
+        "targetReasoningEffort",
+        "reason",
+    }
 
 
 def test_thread_start_replaces_stale_router_namespace() -> None:

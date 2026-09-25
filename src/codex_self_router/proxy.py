@@ -1387,7 +1387,9 @@ class Bridge:
             try:
                 previous = state.profile
                 previous_effort = state.effort or PROFILES[previous].effort
-                target, target_effort = parse_switch_arguments(params, previous, previous_effort)
+                target, target_effort, reason = parse_switch_arguments(
+                    params, previous, previous_effort
+                )
             except ValueError as exc:
                 await self._send_upstream(_tool_result(request_id, str(exc), success=False))
                 return
@@ -1401,6 +1403,7 @@ class Bridge:
                 to_profile=target.value,
                 source="agent-tool",
                 outcome="pending",
+                reason=reason,
                 switch_id=str(uuid.uuid4()),
                 requested_at=utc_now(),
                 from_effort=previous_effort,
@@ -1454,6 +1457,7 @@ class Bridge:
                     previous_effort=previous_effort,
                     target=target,
                     target_effort=target_effort,
+                    reason=reason,
                 )
                 switch.approval_ms = round((time.monotonic() - approval_started) * 1000, 3)
                 switch.authorization = "user-approved" if approved else "user-denied"
@@ -1610,6 +1614,7 @@ class Bridge:
         previous_effort: str,
         target: ProfileName,
         target_effort: str,
+        reason: str | None = None,
     ) -> str:
         key = (thread_id, turn_id)
         if key in self.turn_completion_waiters:
@@ -1686,6 +1691,7 @@ class Bridge:
         previous_effort: str,
         target: ProfileName,
         target_effort: str,
+        reason: str | None = None,
     ) -> bool:
         approval_id = f"self-router-approval-{uuid.uuid4()}"
         future: asyncio.Future[dict[str, Any]] = asyncio.get_running_loop().create_future()
@@ -1707,6 +1713,7 @@ class Bridge:
                             "question": (
                                 f"Switch {previous.value}/{previous_effort} → "
                                 f"{target.value}/{target_effort}?"
+                                + (f"\nReason: {reason}" if reason else "")
                             ),
                             "isOther": False,
                             "isSecret": False,

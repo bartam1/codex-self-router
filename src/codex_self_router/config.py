@@ -239,7 +239,7 @@ def _rebuild_contract() -> None:
             "Proactively request the model and reasoning effort best suited to the next "
             "substantial phase. Either targetProfile or targetReasoningEffort may be "
             "omitted to keep its current value. Profiles are luna, terra, sol, or astra; "
-            "reasoning efforts are low, medium, or xhigh."
+            "reasoning efforts are low, medium, or xhigh. An optional reason may provide context."
         ),
         "inputSchema": {
             "type": "object",
@@ -256,6 +256,10 @@ def _rebuild_contract() -> None:
                     "type": "string",
                     "enum": efforts,
                     "description": "Destination effort; omit to use the profile default.",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Optional context for the routing decision; not required.",
                 },
             },
             "anyOf": [

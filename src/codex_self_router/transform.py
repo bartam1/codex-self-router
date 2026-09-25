@@ -209,7 +209,7 @@ def is_route_state_tool_call(message: dict[str, Any]) -> bool:
 
 def parse_switch_arguments(
     params: dict[str, Any], current_profile: ProfileName, current_effort: str
-) -> tuple[ProfileName, str]:
+) -> tuple[ProfileName, str, str | None]:
     arguments = params.get("arguments")
     if not isinstance(arguments, dict):
         raise ValueError("tool arguments must be an object")
@@ -228,8 +228,9 @@ def parse_switch_arguments(
             if raw_effort is not None
             else PROFILES[target].effort
         )
+        reason = str(arguments["reason"]).strip() or None if "reason" in arguments else None
     except (TypeError, ValueError) as exc:
         raise ValueError(f"invalid switch arguments: {exc}") from exc
     if effort not in PROFILES[target].allowed_efforts:
         raise ValueError(f"{target.value} does not allow reasoning effort {effort}")
-    return target, effort
+    return target, effort, reason
