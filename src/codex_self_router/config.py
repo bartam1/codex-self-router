@@ -56,9 +56,8 @@ Model and reasoning routing is managed by the self-router.
 - At the start of each substantial phase, proactively choose both the model profile and reasoning
   effort that fit the upcoming work. You are responsible for requesting a change; do not wait for
   the user to suggest it.
-- At the start of a substantial phase, use self_router.get_current_route when available to verify
-  the exact active profile, model, reasoning effort, and approval policy rather than guessing or
-  asking the user. A successful switch/no-op result also establishes the current route.
+- Use self_router.get_current_route only when the active route is uncertain or after a model/effort
+  switch; do not repeat it at the start of every turn when the route is already known.
 - The active agent-switch approval mode is {{approval_mode}}. `always` prompts for every effective
   change, `upgrades_only` automatically permits changes that do not increase model price or
   reasoning effort, and `never` automatically permits every valid change. A possible approval
