@@ -18,8 +18,10 @@ from codex_self_router.config import (
     default_config_yaml,
     get_agent_switching_enabled,
     get_default_profile,
+    get_live_turn_costs,
     get_switch_approval,
     load_config,
+    profile_for_model,
     routing_policy,
     switch_requires_approval,
 )
@@ -39,6 +41,7 @@ def test_default_yaml_round_trips_and_exposes_full_matrix(tmp_path):
     assert load_config(path) == path
     assert get_default_profile() == ProfileName.SOL
     assert get_agent_switching_enabled()
+    assert get_live_turn_costs()
     assert get_switch_approval() == SwitchApproval.ALWAYS
     assert "Separate decision-making from mechanical execution" in routing_policy()
     assert "{{profiles}}" not in routing_policy()
@@ -48,6 +51,10 @@ def test_default_yaml_round_trips_and_exposes_full_matrix(tmp_path):
     assert DIRECTIVE_ROUTES["s3"] == (ProfileName.SOL, "xhigh")
     assert DIRECTIVE_ROUTES["a3"] == (ProfileName.ASTRA, "xhigh")
     assert PROFILES[ProfileName.TERRA].model == "gpt-5.6-terra"
+    assert PROFILES[ProfileName.LUNA].model == "gpt-6-luna"
+    assert PROFILES[ProfileName.SOL].model == "gpt-6-sol"
+    assert profile_for_model("gpt-5.6-luna") == ProfileName.LUNA
+    assert profile_for_model("gpt-5.6-sol") == ProfileName.SOL
     parsed = parse_directive("a1 investigate")
     assert (parsed.profile, parsed.effort, parsed.text) == (
         ProfileName.ASTRA,
@@ -99,6 +106,11 @@ def test_invalid_yaml_routes_fail_closed():
         apply_config(data)
 
     data = copy.deepcopy(DEFAULT_CONFIG)
+    data["live_turn_costs"] = "yes"
+    with pytest.raises(ValueError, match="live_turn_costs must be true or false"):
+        apply_config(data)
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
     data["legacy_directives"]["l1"] = {"profile": "astra", "effort": "xhigh"}
     with pytest.raises(ValueError, match="duplicate directive marker l1"):
         apply_config(data)
@@ -106,6 +118,16 @@ def test_invalid_yaml_routes_fail_closed():
     data = copy.deepcopy(DEFAULT_CONFIG)
     data["profiles"]["luna"]["price"]["input"] = math.nan
     with pytest.raises(ValueError, match="finite and non-negative"):
+        apply_config(data)
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["profiles"]["terra"]["model_aliases"] = ["gpt-6-sol"]
+    with pytest.raises(ValueError, match="duplicate model alias"):
+        apply_config(data)
+
+    data = copy.deepcopy(DEFAULT_CONFIG)
+    data["profiles"]["sol"]["model_aliases"] = "gpt-5.6-sol"
+    with pytest.raises(ValueError, match="model_aliases must be a list"):
         apply_config(data)
 
 
@@ -189,7 +211,7 @@ def test_custom_policy_template_is_injected_and_old_config_falls_back():
     apply_config(data)
     assert routing_policy().startswith("Custom policy.")
     assert "\nalways\n" in routing_policy()
-    assert "Sol (gpt-5.6-sol)" in routing_policy()
+    assert "Sol (gpt-6-sol)" in routing_policy()
 
     del data["routing_policy_template"]
     apply_config(data)

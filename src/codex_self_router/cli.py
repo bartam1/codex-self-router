@@ -21,6 +21,7 @@ from .config import (
     default_config_path,
     default_config_yaml,
     get_agent_switching_enabled,
+    get_live_turn_costs,
     get_switch_approval,
     load_config,
     set_agent_switching_enabled,
@@ -382,6 +383,7 @@ async def async_main(args: argparse.Namespace) -> int:
             + ("enabled" if get_agent_switching_enabled() else "disabled")
         )
         print(f"Agent switch approval: {get_switch_approval().value}")
+        print(f"Live turn costs: {'enabled' if get_live_turn_costs() else 'disabled'}")
         for marker, (name, effort) in DIRECTIVE_ROUTES.items():
             if marker.startswith("#"):
                 continue

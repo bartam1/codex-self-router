@@ -2,6 +2,7 @@ version: 1
 default_profile: sol
 agent_switching_enabled: true
 agent_switch_approval: always
+live_turn_costs: true
 routing_policy_template: |
   Model and reasoning routing is managed by the self-router.
 
@@ -50,12 +51,13 @@ legacy_directives:
   '#3': {profile: astra, effort: xhigh}
 profiles:
   luna:
-    model: gpt-5.6-luna
+    model: gpt-6-luna
+    model_aliases: [gpt-5.6-luna]
     default_effort: medium
     directive_prefix: l
     allowed_efforts: [low, medium, xhigh]
     description: Fast high-volume, lookup, collection, and mechanical work.
-    price: {input: 0.2, cached_input: 0.02, cache_write_input: 0.25, output: 1.2}
+    price: {input: 0.1, cached_input: 0.01, cache_write_input: 0.125, output: 0.5}
   terra:
     model: gpt-5.6-terra
     default_effort: medium
@@ -64,12 +66,13 @@ profiles:
     description: Everyday production work requiring balanced judgment.
     price: {input: 2.0, cached_input: 0.2, cache_write_input: 2.5, output: 12.0}
   sol:
-    model: gpt-5.6-sol
+    model: gpt-6-sol
+    model_aliases: [gpt-5.6-sol]
     default_effort: medium
     directive_prefix: s
     allowed_efforts: [low, medium, xhigh]
     description: Advanced coding, ambiguous problems, and difficult debugging.
-    price: {input: 4.0, cached_input: 0.4, cache_write_input: 5.0, output: 20.0}
+    price: {input: 2.0, cached_input: 0.2, cache_write_input: 2.5, output: 10.0}
   astra:
     model: gpt-6-astra
     default_effort: xhigh

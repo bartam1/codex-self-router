@@ -13,6 +13,7 @@ Key capabilities:
 - explicit route directives such as `l1`, `s2`, or task-scoped `a3~`;
 - configurable approvals, including fully automatic or upgrades-only routing;
 - session resume and `/btw` thread-fork support;
+- live per-turn token and API-equivalent cost notices in the Codex CLI;
 - per-response usage, route, latency, and API-equivalent cost reports;
 - fixed-model control runs for evaluating whether routing actually helps;
 - a kill switch for autonomous routing via YAML or `--disable-agent-switching`.
@@ -59,6 +60,13 @@ Codex TUI  <-- WebSocket -->  codex-self-router  <-- JSONL/stdin -->  codex app-
 It uses Codex app-server's experimental dynamic tools and `turn/settings/update` API. See the
 [official Codex app-server documentation](https://developers.openai.com/codex/app-server).
 
+At the end of each turn, the router prints a client-only notice with the observed input, cached
+input, output, and reasoning tokens, the configured API-equivalent cost for that turn, the known
+session total, and the route used. The notice is sent only to the Codex CLI and is never forwarded
+to the model or added to conversation context. Set `live_turn_costs: false` in the YAML config to
+hide it. These are usage-based estimates from the configured prices, not ChatGPT subscription
+charges or provider billing records.
+
 ## Profiles and explicit directives
 
 In a fresh thread, every new, unmarked instruction starts on Sol. Resumed threads keep their last
@@ -69,10 +77,13 @@ approval dialog. The suffix means `1=low`, `2=medium`, and `3=xhigh`:
 
 | Prefix | Profile | Model | Low | Medium | XHigh |
 |---|---|---|---|---|---|
-| `l` | Luna | `gpt-5.6-luna` | `l1` | `l2` | `l3` |
+| `l` | Luna | `gpt-6-luna` | `l1` | `l2` | `l3` |
 | `t` | Terra | `gpt-5.6-terra` | `t1` | `t2` | `t3` |
-| `s` | Sol | `gpt-5.6-sol` | `s1` | `s2` | `s3` |
+| `s` | Sol | `gpt-6-sol` | `s1` | `s2` | `s3` |
 | `a` | Astra | `gpt-6-astra` | `a1` | `a2` | `a3` |
+
+Optional `model_aliases` entries let the router recognize older model IDs in saved sessions while
+new turns use the profile's canonical `model`.
 
 Examples:
 
@@ -114,8 +125,8 @@ steering message.
 
 The default user configuration is `~/.config/codex-self-router/config.yaml`. It configures the
 agent-switch approval policy, model IDs, default and allowed efforts, directive prefixes and
-levels, descriptions used by the routing policy, and the API-equivalent prices captured in new
-reports. See
+levels, live turn-cost display, descriptions used by the routing policy, and the API-equivalent
+prices captured in new reports. See
 `config.example.yaml`. Use a different file with the global option
 `--config /path/to/config.yaml`, before the subcommand. Create the defaults on another machine with:
 

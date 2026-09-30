@@ -42,6 +42,7 @@ class Price:
 class Profile:
     name: ProfileName
     model: str
+    model_aliases: tuple[str, ...]
     effort: str
     price: Price
     directive_prefix: str
@@ -97,6 +98,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_profile": "sol",
     "agent_switching_enabled": True,
     "agent_switch_approval": "always",
+    "live_turn_costs": True,
     "routing_policy_template": DEFAULT_ROUTING_POLICY_TEMPLATE,
     "effort_levels": {"1": "low", "2": "medium", "3": "xhigh"},
     "legacy_directives": {
@@ -106,16 +108,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "profiles": {
         "luna": {
-            "model": "gpt-5.6-luna",
+            "model": "gpt-6-luna",
+            "model_aliases": ["gpt-5.6-luna"],
             "default_effort": "medium",
             "directive_prefix": "l",
             "allowed_efforts": ["low", "medium", "xhigh"],
             "description": "Fast high-volume, lookup, collection, and mechanical work.",
             "price": {
-                "input": 0.20,
-                "cached_input": 0.02,
-                "cache_write_input": 0.25,
-                "output": 1.20,
+                "input": 0.10,
+                "cached_input": 0.01,
+                "cache_write_input": 0.125,
+                "output": 0.50,
             },
         },
         "terra": {
@@ -132,16 +135,17 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
         "sol": {
-            "model": "gpt-5.6-sol",
+            "model": "gpt-6-sol",
+            "model_aliases": ["gpt-5.6-sol"],
             "default_effort": "medium",
             "directive_prefix": "s",
             "allowed_efforts": ["low", "medium", "xhigh"],
             "description": "Advanced coding, ambiguous problems, and difficult debugging.",
             "price": {
-                "input": 4.00,
-                "cached_input": 0.40,
-                "cache_write_input": 5.00,
-                "output": 20.00,
+                "input": 2.00,
+                "cached_input": 0.20,
+                "cache_write_input": 2.50,
+                "output": 10.00,
             },
         },
         "astra": {
@@ -165,6 +169,7 @@ DIRECTIVE_ROUTES: dict[str, tuple[ProfileName, str]] = {}
 DEFAULT_PROFILE = ProfileName.SOL
 AGENT_SWITCH_APPROVAL = SwitchApproval.ALWAYS
 AGENT_SWITCHING_ENABLED = True
+LIVE_TURN_COSTS = True
 EFFORT_LEVELS: dict[str, str] = {}
 ROUTER_NAMESPACE = "self_router"
 ROUTER_TOOL = "request_model_switch"
@@ -293,15 +298,20 @@ def _rebuild_contract() -> None:
 
 def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     global DEFAULT_PROFILE, AGENT_SWITCH_APPROVAL, EFFORT_LEVELS, ACTIVE_CONFIG_PATH
-    global AGENT_SWITCHING_ENABLED, ROUTING_POLICY_TEMPLATE
+    global AGENT_SWITCHING_ENABLED, LIVE_TURN_COSTS, ROUTING_POLICY_TEMPLATE
     if data.get("version") != 1:
         raise ValueError("config version must be 1")
     raw_profiles = _mapping(data.get("profiles"), "profiles")
     profiles: dict[ProfileName, Profile] = {}
     prefixes: set[str] = set()
+    models: set[str] = set()
     for name in ProfileName:
         raw = _mapping(raw_profiles.get(name.value), f"profiles.{name.value}")
         model = str(raw.get("model", "")).strip()
+        raw_aliases = raw.get("model_aliases", [])
+        if not isinstance(raw_aliases, list):
+            raise ValueError(f"profiles.{name.value}.model_aliases must be a list")
+        model_aliases = tuple(str(item).strip() for item in raw_aliases)
         prefix = str(raw.get("directive_prefix", "")).strip()
         default_effort = str(raw.get("default_effort", "")).strip()
         allowed = tuple(str(item).strip() for item in raw.get("allowed_efforts", []))
@@ -313,10 +323,19 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
             or any(c.isspace() for c in prefix)
         ):
             raise ValueError(f"invalid or duplicate directive prefix for profile {name.value}")
+        profile_models = (model, *model_aliases)
+        if (
+            any(not item for item in profile_models)
+            or len(profile_models) != len(set(profile_models))
+            or models.intersection(profile_models)
+        ):
+            raise ValueError(f"invalid or duplicate model alias for profile {name.value}")
         prefixes.add(prefix)
+        models.update(profile_models)
         profiles[name] = Profile(
             name,
             model,
+            model_aliases,
             default_effort,
             _price(raw.get("price"), name.value),
             prefix,
@@ -365,6 +384,9 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     agent_switching = data.get("agent_switching_enabled", True)
     if not isinstance(agent_switching, bool):
         raise ValueError("agent_switching_enabled must be true or false")
+    live_turn_costs = data.get("live_turn_costs", True)
+    if not isinstance(live_turn_costs, bool):
+        raise ValueError("live_turn_costs must be true or false")
     template = data.get("routing_policy_template", DEFAULT_ROUTING_POLICY_TEMPLATE)
     if not isinstance(template, str) or not template.strip():
         raise ValueError("routing_policy_template must be a non-empty string")
@@ -385,6 +407,7 @@ def apply_config(data: dict[str, Any], path: Path | None = None) -> None:
     DEFAULT_PROFILE = default
     AGENT_SWITCH_APPROVAL = approval
     AGENT_SWITCHING_ENABLED = agent_switching
+    LIVE_TURN_COSTS = live_turn_costs
     ROUTING_POLICY_TEMPLATE = template
     EFFORT_LEVELS = levels
     ACTIVE_CONFIG_PATH = path
@@ -409,7 +432,14 @@ def load_config(path: Path | None = None) -> Path | None:
 def profile_for_model(model: str | None) -> ProfileName | None:
     if model is None:
         return None
-    return next((name for name, profile in PROFILES.items() if profile.model == model), None)
+    return next(
+        (
+            name
+            for name, profile in PROFILES.items()
+            if profile.model == model or model in profile.model_aliases
+        ),
+        None,
+    )
 
 
 def get_default_profile() -> ProfileName:
@@ -422,6 +452,10 @@ def get_switch_approval() -> SwitchApproval:
 
 def get_agent_switching_enabled() -> bool:
     return AGENT_SWITCHING_ENABLED
+
+
+def get_live_turn_costs() -> bool:
+    return LIVE_TURN_COSTS
 
 
 def set_agent_switching_enabled(value: bool) -> None:
@@ -466,6 +500,7 @@ def config_snapshot() -> dict[str, Any]:
         "path": str(ACTIVE_CONFIG_PATH) if ACTIVE_CONFIG_PATH else None,
         "defaultProfile": DEFAULT_PROFILE.value,
         "agentSwitchingEnabled": AGENT_SWITCHING_ENABLED,
+        "liveTurnCosts": LIVE_TURN_COSTS,
         "agentSwitchApproval": AGENT_SWITCH_APPROVAL.value,
         "routingPolicyTemplate": ROUTING_POLICY_TEMPLATE,
         "effortLevels": dict(EFFORT_LEVELS),

@@ -22,6 +22,7 @@ from .config import (
     config_snapshot,
     get_agent_switching_enabled,
     get_default_profile,
+    get_live_turn_costs,
     get_switch_approval,
     merge_routing_policy,
     profile_for_model,
@@ -29,11 +30,20 @@ from .config import (
     switch_requires_approval,
 )
 from .measurement import Measurements
-from .report import ReportStore, SessionReport, SwitchRecord, UsageRecord, parse_timestamp, utc_now
+from .report import (
+    ReportStore,
+    SessionReport,
+    SwitchRecord,
+    UsageRecord,
+    parse_timestamp,
+    record_cost,
+    utc_now,
+)
 from .resume import RolloutReader, ThreadLease
 from .transform import (
     TurnRoute,
     enable_experimental_api,
+    enforce_step_model_switching,
     is_route_state_tool_call,
     is_router_tool_call,
     parse_switch_arguments,
@@ -150,6 +160,7 @@ class Bridge:
         self.fixed_profile = fixed_profile
         self.switch_approval = switch_approval or get_switch_approval()
         self.agent_switching_enabled = get_agent_switching_enabled()
+        self.live_turn_costs = get_live_turn_costs()
         self.report.metadata = {
             "routerVersion": __version__,
             "codexBinary": str(codex_bin),
@@ -183,6 +194,7 @@ class Bridge:
         self.response_condition = asyncio.Condition()
         self.turn_completion_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self.automatic_continuation_turns: set[tuple[str, str]] = set()
+        self.cost_notified_turns: set[tuple[str, str]] = set()
         self.background: set[asyncio.Task[Any]] = set()
         self.catalog_validation_started = False
         self.closed = False
@@ -369,6 +381,8 @@ class Bridge:
     async def _resume_thread(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
         params = copy.deepcopy(message.get("params") or {})
+        if self.fixed_profile is None:
+            enforce_step_model_switching(params)
         thread_id = str(params.get("threadId", ""))
         lock = self.resume_locks.setdefault(thread_id, asyncio.Lock())
         async with lock:
@@ -622,6 +636,8 @@ class Bridge:
                 config = {}
                 params["config"] = config
             config["model_reasoning_effort"] = effort
+            if self.fixed_profile is None:
+                enforce_step_model_switching(params)
             instructions = params.get("developerInstructions")
             if instructions is not None and self.fixed_profile is None:
                 instructions = merge_routing_policy(instructions)
@@ -808,6 +824,8 @@ class Bridge:
                 restored_route = (thread_id, *restored)
             elif directive_lock_released:
                 self._checkpoint_thread(thread_id)
+            if self.live_turn_costs:
+                await self._notify_turn_cost(thread_id, turn_id)
 
         if is_route_state_tool_call(message):
             await self._handle_route_state_call(message)
@@ -872,6 +890,62 @@ class Bridge:
                         "current turn completes."
                     ),
                 },
+            }
+        )
+
+    async def _notify_turn_cost(self, thread_id: str, turn_id: str) -> None:
+        key = (thread_id, turn_id)
+        if not thread_id or not turn_id or key in self.cost_notified_turns:
+            return
+        self.cost_notified_turns.add(key)
+        records = [
+            record
+            for record in self.report.responses
+            if record.thread_id == thread_id and record.turn_id == turn_id
+        ]
+        if not records:
+            message = "Self-router turn usage: unavailable (Codex exposed no usage record)."
+        else:
+            costs = [record_cost(record, record.profile, self.report.prices) for record in records]
+            priced = [cost for cost in costs if cost is not None]
+            complete = len(priced) == len(records)
+            turn_cost = sum(priced)
+            session_costs = self.report.costs()
+            def token_total(name: str) -> int:
+                values = (
+                    record.usage.get(name, 0)
+                    for record in records
+                    if isinstance(record.usage, dict)
+                )
+                return sum(value for value in values if type(value) is int and value >= 0)
+
+            input_tokens = token_total("inputTokens")
+            cached_tokens = token_total("cachedInputTokens")
+            output_tokens = token_total("outputTokens")
+            reasoning_tokens = token_total("reasoningOutputTokens")
+            routes = list(
+                dict.fromkeys(
+                    f"{record.profile}/{record.effort or 'unknown'}"
+                    for record in records
+                    if record.profile
+                )
+            )
+            qualifier = "" if complete else "known "
+            message = (
+                f"Self-router turn usage: {qualifier}${turn_cost:.6f} configured "
+                f"API-equivalent; session known ${session_costs['routedApiEquivalentUsd']:.6f}; "
+                f"{input_tokens:,} input ({cached_tokens:,} cached), "
+                f"{output_tokens:,} output ({reasoning_tokens:,} reasoning)"
+            )
+            if routes:
+                message += "; route " + " → ".join(routes)
+            if not complete:
+                message += f"; {len(records) - len(priced)} response(s) unpriced"
+            message += "."
+        await self._send_client(
+            {
+                "method": "warning",
+                "params": {"threadId": thread_id, "message": message},
             }
         )
 

@@ -34,7 +34,7 @@ def usage_record(profile: str = "luna") -> UsageRecord:
 
 def test_cost_uses_separate_cache_buckets_without_double_counting() -> None:
     # Luna: 700k regular input + 200k cache hit + 100k cache write + 10k output.
-    assert record_cost(usage_record(), ProfileName.LUNA) == 0.181
+    assert record_cost(usage_record(), ProfileName.LUNA) == 0.0895
 
 
 def test_report_compares_same_observed_usage(tmp_path) -> None:

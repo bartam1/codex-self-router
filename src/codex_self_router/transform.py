@@ -100,6 +100,19 @@ def enable_experimental_api(message: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def enforce_step_model_switching(params: dict[str, Any]) -> None:
+    """Keep a client thread override from disabling the router's required feature."""
+    config = params.get("config")
+    if not isinstance(config, dict):
+        config = {}
+        params["config"] = config
+    features = config.get("features")
+    if not isinstance(features, dict):
+        features = {}
+        config["features"] = features
+    features["step_model_switching"] = True
+
+
 def prepare_thread_start(
     message: dict[str, Any],
     fixed_profile: ProfileName | None = None,
@@ -114,6 +127,9 @@ def prepare_thread_start(
     if fixed_profile or (explicit is None and not params.get("model")):
         profile = PROFILES[selected]
         params["model"] = profile.model
+
+    if fixed_profile is None:
+        enforce_step_model_switching(params)
 
     tools = list(params.get("dynamicTools") or [])
     tools = [

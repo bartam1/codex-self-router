@@ -236,6 +236,23 @@ def test_unknown_client_override_is_rejected_instead_of_silently_misreported() -
         )
 
 
+def test_old_model_alias_is_accepted_and_normalized_to_current_profile_model() -> None:
+    message, route = prepare_turn_start(
+        {
+            "method": "turn/start",
+            "params": {
+                "threadId": "thread-1",
+                "model": "gpt-5.6-sol",
+                "input": [],
+            },
+        }
+    )
+
+    assert route.profile == ProfileName.SOL
+    assert route.source == "client-override"
+    assert message["params"]["model"] == "gpt-6-sol"
+
+
 def test_directive_updates_collaboration_mode_that_would_otherwise_take_precedence() -> None:
     message, route = prepare_turn_start(
         {
