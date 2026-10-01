@@ -62,10 +62,10 @@ It uses Codex app-server's experimental dynamic tools and `turn/settings/update`
 
 At the end of each turn, the router prints a client-only notice with the observed input, cached
 input, output, and reasoning tokens, the configured API-equivalent cost for that turn, the known
-session total, and the route used. The notice is sent only to the Codex CLI and is never forwarded
-to the model or added to conversation context. Set `live_turn_costs: false` in the YAML config to
-hide it. These are usage-based estimates from the configured prices, not ChatGPT subscription
-charges or provider billing records.
+session total, local timestamp, and exact model/effort route used. The notice is sent only to the
+Codex CLI and is never forwarded to the model or added to conversation context. Set
+`live_turn_costs: false` in the YAML config to hide it. These are usage-based estimates from the
+configured prices, not ChatGPT subscription charges or provider billing records.
 
 ## Profiles and explicit directives
 
@@ -79,7 +79,7 @@ approval dialog. The suffix means `1=low`, `2=medium`, and `3=xhigh`:
 |---|---|---|---|---|---|
 | `l` | Luna | `gpt-6-luna` | `l1` | `l2` | `l3` |
 | `t` | Terra | `gpt-5.6-terra` | `t1` | `t2` | `t3` |
-| `s` | Sol | `gpt-6-sol` | `s1` | `s2` | `s3` |
+| `s` | Sol | `gpt-6.1-sol` | `s1` | `s2` | `s3` |
 | `a` | Astra | `gpt-6-astra` | `a1` | `a2` | `a3` |
 
 Optional `model_aliases` entries let the router recognize older model IDs in saved sessions while
@@ -187,8 +187,11 @@ states explicitly that model-switch authorization never authorizes commands or e
 
 The namespace exposes a read-only `self_router.get_current_route` tool returning the exact active
 profile, model ID, reasoning effort, and switch-approval policy without changing models or granting
-permission for commands. Route state is returned as tool output rather than appended to user input,
-so it does not alter or visibly duplicate the user's message.
+permission for commands. On every turn, the router also publishes the active route and any
+user-directive lock through app-server `additionalContext` with `kind: application`. This compact,
+client-supplied context is model-visible without altering or visibly duplicating the user's message.
+The agent is instructed to call `request_model_switch` only when its desired route differs and to
+use `get_current_route` only if the supplied state is missing or inconsistent.
 
 ## Requirements
 

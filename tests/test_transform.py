@@ -250,7 +250,7 @@ def test_old_model_alias_is_accepted_and_normalized_to_current_profile_model() -
 
     assert route.profile == ProfileName.SOL
     assert route.source == "client-override"
-    assert message["params"]["model"] == "gpt-6-sol"
+    assert message["params"]["model"] == "gpt-6.1-sol"
 
 
 def test_directive_updates_collaboration_mode_that_would_otherwise_take_precedence() -> None:

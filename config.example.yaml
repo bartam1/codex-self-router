@@ -7,12 +7,11 @@ routing_policy_template: |
   Model and reasoning routing is managed by the self-router.
 
   {{agent_switching}}
-  - At the start of each substantial phase, proactively choose both the model profile and reasoning
-    effort that fit the upcoming work. You are responsible for requesting a change; do not wait for
-    the user to suggest it.
-  - At the start of a substantial phase, use self_router.get_current_route when available to verify
-    the exact active profile, model, reasoning effort, and approval policy rather than guessing or
-    asking the user. A successful switch/no-op result also establishes the current route.
+  - Each turn includes authoritative self-router state as application context. Compare the upcoming
+    phase's needs with that active profile and reasoning effort.
+  - Call self_router.request_model_switch only when the desired profile or effort differs from the
+    supplied state. Never call it to confirm the current route. Use self_router.get_current_route
+    only if the supplied state is absent or inconsistent with a switch result.
   - The active agent-switch approval mode is {{approval_mode}}. `always` prompts for every effective
     change, `upgrades_only` automatically permits changes that do not increase model price or
     reasoning effort, and `never` automatically permits every valid change. A possible approval
@@ -66,13 +65,13 @@ profiles:
     description: Everyday production work requiring balanced judgment.
     price: {input: 2.0, cached_input: 0.2, cache_write_input: 2.5, output: 12.0}
   sol:
-    model: gpt-6-sol
-    model_aliases: [gpt-5.6-sol]
+    model: gpt-6.1-sol
+    model_aliases: [gpt-6-sol, gpt-5.6-sol]
     default_effort: medium
     directive_prefix: s
     allowed_efforts: [low, medium, xhigh]
     description: Advanced coding, ambiguous problems, and difficult debugging.
-    price: {input: 2.0, cached_input: 0.2, cache_write_input: 2.5, output: 10.0}
+    price: {input: 2.0, cached_input: 0.1, cache_write_input: 2.5, output: 10.0}
   astra:
     model: gpt-6-astra
     default_effort: xhigh

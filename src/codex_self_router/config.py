@@ -54,11 +54,11 @@ DEFAULT_ROUTING_POLICY_TEMPLATE = """\
 Model and reasoning routing is managed by the self-router.
 
 {{agent_switching}}
-- At the start of each substantial phase, proactively choose both the model profile and reasoning
-  effort that fit the upcoming work. You are responsible for requesting a change; do not wait for
-  the user to suggest it.
-- Use self_router.get_current_route only when the active route is uncertain or after a model/effort
-  switch; do not repeat it at the start of every turn when the route is already known.
+- Each turn includes authoritative self-router state as application context. Compare the upcoming
+  phase's needs with that active profile and reasoning effort.
+- Call self_router.request_model_switch only when the desired profile or effort differs from the
+  supplied state. Never call it to confirm the current route. Use self_router.get_current_route
+  only if the supplied state is absent or inconsistent with a switch result.
 - The active agent-switch approval mode is {{approval_mode}}. `always` prompts for every effective
   change, `upgrades_only` automatically permits changes that do not increase model price or
   reasoning effort, and `never` automatically permits every valid change. A possible approval
@@ -135,15 +135,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
             },
         },
         "sol": {
-            "model": "gpt-6-sol",
-            "model_aliases": ["gpt-5.6-sol"],
+            "model": "gpt-6.1-sol",
+            "model_aliases": ["gpt-6-sol", "gpt-5.6-sol"],
             "default_effort": "medium",
             "directive_prefix": "s",
             "allowed_efforts": ["low", "medium", "xhigh"],
             "description": "Advanced coding, ambiguous problems, and difficult debugging.",
             "price": {
                 "input": 2.00,
-                "cached_input": 0.20,
+                "cached_input": 0.10,
                 "cache_write_input": 2.50,
                 "output": 10.00,
             },
@@ -240,8 +240,9 @@ def _rebuild_contract() -> None:
         "type": "function",
         "name": ROUTER_TOOL,
         "description": (
-            "Proactively request the model and reasoning effort best suited to the next "
-            "substantial phase. Either targetProfile or targetReasoningEffort may be "
+            "Request a different model or reasoning effort for the next substantial phase. "
+            "The current route is supplied in application context; never call this tool merely "
+            "to confirm that route. Either targetProfile or targetReasoningEffort may be "
             "omitted to keep its current value. Profiles are luna, terra, sol, or astra; "
             "reasoning efforts are low, medium, or xhigh. An optional reason may provide context."
         ),
@@ -278,7 +279,8 @@ def _rebuild_contract() -> None:
         "name": ROUTER_STATE_TOOL,
         "description": (
             "Return the exact active router profile, model, reasoning effort, and "
-            "agent-switch configuration. This read-only call never changes state."
+            "agent-switch configuration when the per-turn route context is absent or "
+            "inconsistent. This read-only call never changes state."
         ),
         "inputSchema": {
             "type": "object",

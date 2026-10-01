@@ -24,6 +24,7 @@ _LEADING_DIRECTIVE = re.compile(r"^(?P<leading>\s*)(?P<marker>\S+)(?=\s|$)(?P<re
 _TRAILING_DIRECTIVE = re.compile(
     r"^(?P<body>[\s\S]*\S)(?P<separator>\s+)(?P<marker>\S+)(?P<trailing>\s*)$"
 )
+ROUTE_CONTEXT_KEY = "codex-self-router.route"
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,6 +114,37 @@ def enforce_step_model_switching(params: dict[str, Any]) -> None:
     features["step_model_switching"] = True
 
 
+def inject_route_context(
+    params: dict[str, Any],
+    profile: ProfileName,
+    effort: str,
+    route_lock: str = "none",
+) -> None:
+    """Publish authoritative router state without changing the user's visible message."""
+    context = params.get("additionalContext")
+    if not isinstance(context, dict):
+        context = {}
+        params["additionalContext"] = context
+    model = PROFILES[profile].model
+    if route_lock == "none":
+        instruction = (
+            "Call self_router.request_model_switch only when the desired profile or reasoning "
+            "effort differs; never call it to confirm this route."
+        )
+    else:
+        instruction = (
+            "This route is locked for the current task; do not call "
+            "self_router.request_model_switch."
+        )
+    context[ROUTE_CONTEXT_KEY] = {
+        "kind": "application",
+        "value": (
+            f"Self-router state: active={profile.value}/{effort} ({model}); "
+            f"lock={route_lock}. {instruction}"
+        ),
+    }
+
+
 def prepare_thread_start(
     message: dict[str, Any],
     fixed_profile: ProfileName | None = None,
@@ -154,6 +186,7 @@ def prepare_turn_start(
     fixed_profile: ProfileName | None = None,
     resumed_profile: ProfileName | None = None,
     resumed_effort: str | None = None,
+    existing_route_lock: str = "none",
 ) -> tuple[dict[str, Any], TurnRoute]:
     result = copy.deepcopy(message)
     params = result.setdefault("params", {})
@@ -199,6 +232,12 @@ def prepare_turn_start(
         settings = collaboration_mode.setdefault("settings", {})
         settings["model"] = profile.model
         settings["reasoning_effort"] = effort
+    route_lock = existing_route_lock
+    if fixed_profile is not None:
+        route_lock = "fixed-profile"
+    elif directive.profile is not None:
+        route_lock = "user-directive"
+    inject_route_context(params, selected, effort, route_lock)
     return result, TurnRoute(selected, effort, source, marker, directive.temporary)
 
 

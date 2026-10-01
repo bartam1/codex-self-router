@@ -52,7 +52,8 @@ def test_default_yaml_round_trips_and_exposes_full_matrix(tmp_path):
     assert DIRECTIVE_ROUTES["a3"] == (ProfileName.ASTRA, "xhigh")
     assert PROFILES[ProfileName.TERRA].model == "gpt-5.6-terra"
     assert PROFILES[ProfileName.LUNA].model == "gpt-6-luna"
-    assert PROFILES[ProfileName.SOL].model == "gpt-6-sol"
+    assert PROFILES[ProfileName.SOL].model == "gpt-6.1-sol"
+    assert profile_for_model("gpt-6-sol") == ProfileName.SOL
     assert profile_for_model("gpt-5.6-luna") == ProfileName.LUNA
     assert profile_for_model("gpt-5.6-sol") == ProfileName.SOL
     parsed = parse_directive("a1 investigate")
@@ -211,7 +212,7 @@ def test_custom_policy_template_is_injected_and_old_config_falls_back():
     apply_config(data)
     assert routing_policy().startswith("Custom policy.")
     assert "\nalways\n" in routing_policy()
-    assert "Sol (gpt-6-sol)" in routing_policy()
+    assert "Sol (gpt-6.1-sol)" in routing_policy()
 
     del data["routing_policy_template"]
     apply_config(data)

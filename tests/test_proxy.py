@@ -198,11 +198,12 @@ async def test_turn_completion_prints_client_only_live_cost_before_completion(tm
     messages = [json.loads(message) for message in websocket.sent]
     assert [message["method"] for message in messages] == ["warning", "turn/completed"]
     notice = messages[0]["params"]["message"]
-    assert "$0.002440 configured API-equivalent" in notice
-    assert "session known $0.002440" in notice
-    assert "1,000 input (200 cached)" in notice
-    assert "80 output (50 reasoning)" in notice
-    assert "route sol/medium" in notice
+    assert notice.startswith("Self-router API-equivalent usage · ")
+    assert "turn: $0.002420" in notice
+    assert "session: $0.002420 known" in notice
+    assert "1,000 in (200 cached)" in notice
+    assert "80 out (50 reasoning)" in notice
+    assert "gpt-6.1-sol/medium" in notice
 
     await bridge._handle_upstream_payload(json.dumps(completed))
     assert sum(json.loads(message).get("method") == "warning" for message in websocket.sent) == 1

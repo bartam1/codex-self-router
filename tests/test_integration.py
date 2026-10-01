@@ -18,7 +18,7 @@ import sys
 models = [
     ("gpt-6-luna", "medium"),
     ("gpt-5.6-terra", "medium"),
-    ("gpt-6-sol", "medium"),
+    ("gpt-6.1-sol", "medium"),
     ("gpt-6-astra", "xhigh"),
 ]
 

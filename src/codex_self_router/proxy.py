@@ -44,6 +44,7 @@ from .transform import (
     TurnRoute,
     enable_experimental_api,
     enforce_step_model_switching,
+    inject_route_context,
     is_route_state_tool_call,
     is_router_tool_call,
     parse_switch_arguments,
@@ -687,6 +688,11 @@ class Bridge:
                     self.fixed_profile,
                     current.profile if current else None,
                     current.effort if current else None,
+                    (
+                        "user-directive"
+                        if current and current.explicit_route_task_id is not None
+                        else "none"
+                    ),
                 )
                 context.effort = message["params"]["effort"]
             except ValueError as exc:
@@ -903,8 +909,22 @@ class Bridge:
             for record in self.report.responses
             if record.thread_id == thread_id and record.turn_id == turn_id
         ]
+        occurred_at = (
+            max(parse_timestamp(record.timestamp) for record in records)
+            if records
+            else parse_timestamp(utc_now())
+        ).astimezone().isoformat(timespec="seconds")
         if not records:
-            message = "Self-router turn usage: unavailable (Codex exposed no usage record)."
+            state = self.threads.get(thread_id)
+            route = (
+                f" · {PROFILES[state.profile].model}/{state.effort or 'unknown'}"
+                if state is not None
+                else ""
+            )
+            message = (
+                f"Self-router usage · {occurred_at} · unavailable "
+                f"(Codex exposed no usage record){route}."
+            )
         else:
             costs = [record_cost(record, record.profile, self.report.prices) for record in records]
             priced = [cost for cost in costs if cost is not None]
@@ -925,22 +945,24 @@ class Bridge:
             reasoning_tokens = token_total("reasoningOutputTokens")
             routes = list(
                 dict.fromkeys(
-                    f"{record.profile}/{record.effort or 'unknown'}"
+                    f"{record.model or PROFILES[ProfileName(record.profile)].model}/"
+                    f"{record.effort or 'unknown'}"
                     for record in records
-                    if record.profile
+                    if record.model or record.profile
                 )
             )
             qualifier = "" if complete else "known "
             message = (
-                f"Self-router turn usage: {qualifier}${turn_cost:.6f} configured "
-                f"API-equivalent; session known ${session_costs['routedApiEquivalentUsd']:.6f}; "
-                f"{input_tokens:,} input ({cached_tokens:,} cached), "
-                f"{output_tokens:,} output ({reasoning_tokens:,} reasoning)"
+                f"Self-router API-equivalent usage · {occurred_at} · "
+                f"turn: {qualifier}${turn_cost:.6f} · "
+                f"session: ${session_costs['routedApiEquivalentUsd']:.6f} known · "
+                f"{input_tokens:,} in ({cached_tokens:,} cached) · "
+                f"{output_tokens:,} out ({reasoning_tokens:,} reasoning)"
             )
             if routes:
-                message += "; route " + " → ".join(routes)
+                message += " · " + " → ".join(routes)
             if not complete:
-                message += f"; {len(records) - len(priced)} response(s) unpriced"
+                message += f" · {len(records) - len(priced)} response(s) unpriced"
             message += "."
         await self._send_client(
             {
@@ -1730,6 +1752,13 @@ class Bridge:
             settings["model"] = profile.model
             settings["reasoning_effort"] = target_effort
             params["collaborationMode"] = collaboration_mode
+
+        inject_route_context(
+            params,
+            target,
+            target_effort,
+            "user-directive" if state.explicit_route_task_id is not None else "none",
+        )
 
         state.profile = target
         state.effort = target_effort
