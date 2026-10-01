@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import asyncio
+import copy
 import json
+import threading
+
+import pytest
 
 from codex_self_router.config import ProfileName
 from codex_self_router.evaluation import analyze
 from codex_self_router.report import (
     ReportStore,
+    ReportWriter,
     SessionReport,
     SwitchRecord,
     UsageRecord,
@@ -84,3 +90,77 @@ def test_analysis_accepts_legacy_naive_rollout_timestamps() -> None:
     }
 
     assert analyze(report.to_dict())["phases"][0]["observedSteps"] == 1
+
+
+@pytest.mark.asyncio
+async def test_report_writer_coalesces_updates_and_flushes_on_close(tmp_path):
+    report = SessionReport("session-1")
+    saved = []
+
+    class Store(ReportStore):
+        def save(self, snapshot):
+            saved.append(snapshot)
+            return super().save(snapshot)
+
+    store = Store(tmp_path)
+    writer = ReportWriter(store, lambda: copy.deepcopy(report), interval=60)
+    writer.start()
+    for index in range(100):
+        report.metadata["revision"] = index
+        writer.request_save()
+    await writer.close()
+    assert len(saved) == 1
+    assert store.latest()["metadata"]["revision"] == 99
+
+
+@pytest.mark.asyncio
+async def test_shutdown_waits_for_inflight_write_and_preserves_newer_snapshot(tmp_path):
+    report = SessionReport("session-1", metadata={"revision": 1})
+    started = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+    saved = []
+
+    class Store(ReportStore):
+        def save(self, snapshot):
+            saved.append(snapshot)
+            if len(saved) == 1:
+                loop.call_soon_threadsafe(started.set)
+                assert release.wait(timeout=5)
+            return super().save(snapshot)
+
+    store = Store(tmp_path)
+    writer = ReportWriter(store, lambda: copy.deepcopy(report), interval=0)
+    writer.start()
+    writer.request_save()
+    closing = None
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        # The event loop remains responsive while the disk worker is held in save().
+        report.metadata["revision"] = 2
+        writer.request_save()
+        closing = asyncio.create_task(writer.close())
+        await asyncio.sleep(0)
+        assert not closing.done()
+    finally:
+        release.set()
+        await writer.close()
+    if closing is not None:
+        await closing
+    assert [snapshot.metadata["revision"] for snapshot in saved] == [1, 2]
+    assert store.latest()["metadata"]["revision"] == 2
+
+
+@pytest.mark.asyncio
+async def test_report_writer_failure_is_surfaced(tmp_path):
+    class Store(ReportStore):
+        def save(self, snapshot):
+            raise OSError("disk is full")
+
+    writer = ReportWriter(Store(tmp_path), lambda: SessionReport("session-1"))
+    writer.start()
+    writer.request_save()
+    with pytest.raises(OSError, match="disk is full"):
+        await writer.close()
+    with pytest.raises(OSError, match="disk is full"):
+        writer.request_save()

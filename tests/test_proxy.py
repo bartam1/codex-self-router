@@ -23,7 +23,7 @@ from codex_self_router.proxy import (
     _is_async_question_item,
     inspect_model_catalog,
 )
-from codex_self_router.report import ReportStore
+from codex_self_router.report import ReportStore, UsageRecord, parse_timestamp
 
 
 class FakeWebSocket:
@@ -32,6 +32,27 @@ class FakeWebSocket:
 
     async def send(self, message: str) -> None:
         self.sent.append(message)
+
+
+@pytest.mark.asyncio
+async def test_client_replies_only_save_reports_when_wait_state_changes(tmp_path):
+    bridge = Bridge(FakeWebSocket(), codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    saves = []
+    forwarded = []
+    bridge._save_report = lambda: saves.append(bridge.measurements.sequence)
+
+    async def send(message):
+        forwarded.append(message)
+
+    bridge._send_upstream = send
+    await bridge._handle_client_payload(json.dumps({"id": "unrelated", "result": {}}))
+    assert saves == []
+    bridge.measurements.start_wait("approval", "thread-1", "turn-1", "tool-approval")
+    reply = {"id": "approval", "result": {}}
+    await bridge._handle_client_payload(json.dumps(reply))
+    await bridge._handle_client_payload(json.dumps(reply))
+    assert len(saves) == 1
+    assert len(forwarded) == 3
 
 
 def switch_request(request_id: str = "server-1") -> dict:
@@ -230,6 +251,195 @@ async def test_live_turn_cost_notice_can_be_disabled(tmp_path) -> None:
     )
 
     assert [json.loads(message)["method"] for message in websocket.sent] == ["turn/completed"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("usage_before_first_notice", [True, False])
+async def test_late_usage_corrects_notice_without_blocking_completion(
+    tmp_path, monkeypatch, usage_before_first_notice
+) -> None:
+    monkeypatch.setattr("codex_self_router.proxy.TURN_COST_NOTICE_DELAY", 0)
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(ProfileName.SOL, "turn-1", effort="medium")
+    bridge.measurements.start_turn("thread-1", "turn-1")
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }
+        )
+    )
+    assert [json.loads(message)["method"] for message in websocket.sent] == ["turn/completed"]
+    if not usage_before_first_notice:
+        await asyncio.gather(*bridge.background)
+        assert "unavailable" in json.loads(websocket.sent[-1])["params"]["message"]
+    usage = {
+        "method": "rawResponse/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "responseId": "late-response",
+            "usage": {"inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100},
+        },
+    }
+    await bridge._handle_upstream_payload(json.dumps(usage))
+    await asyncio.gather(*bridge.background)
+    notice = json.loads(websocket.sent[-1])["params"]["message"]
+    assert "turn: $0.003000" in notice
+    assert "gpt-6.1-sol/medium" in notice
+    assert ("(updated)" in notice) is (not usage_before_first_notice)
+    completed_at = bridge.measurements.turns[("thread-1", "turn-1")]["ended_at"]
+    assert parse_timestamp(completed_at).astimezone().isoformat(timespec="seconds") in notice
+    count = len(websocket.sent)
+    await bridge._handle_upstream_payload(json.dumps(usage))
+    assert len(websocket.sent) == count  # Duplicate usage must not print or bill twice.
+
+
+@pytest.mark.asyncio
+async def test_late_additional_responses_update_existing_priced_notice(tmp_path, monkeypatch):
+    monkeypatch.setattr("codex_self_router.proxy.TURN_COST_NOTICE_DELAY", 0)
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(ProfileName.SOL, "turn-1", effort="medium")
+    event = {
+        "method": "rawResponse/completed",
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "responseId": "response-1",
+            "usage": {"inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100},
+        },
+    }
+    await bridge._handle_upstream_payload(json.dumps(event))
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }
+        )
+    )
+    for response_id in ("response-2", "response-3"):
+        event["params"]["responseId"] = response_id
+        await bridge._handle_upstream_payload(json.dumps(event))
+    await asyncio.gather(*bridge.background)
+    notices = [
+        message
+        for payload in websocket.sent
+        if (message := json.loads(payload))["method"] == "warning"
+    ]
+    assert len(notices) == 2  # Both late responses are coalesced into one correction.
+    assert "turn: $0.009000" in notices[-1]["params"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_usage_arriving_while_sending_notice_is_not_lost(tmp_path, monkeypatch):
+    monkeypatch.setattr("codex_self_router.proxy.TURN_COST_NOTICE_DELAY", 0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class BlockingWebSocket(FakeWebSocket):
+        async def send(self, message):
+            if not started.is_set():
+                started.set()
+                await release.wait()
+            await super().send(message)
+
+    websocket = BlockingWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(ProfileName.SOL, effort="medium")
+    bridge.cost_completed_turns.add(("thread-1", "turn-1"))
+    event = {
+        "params": {
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "responseId": "response-1",
+            "usage": {"inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100},
+        }
+    }
+    await bridge._observe_raw_response(event)
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        event["params"]["responseId"] = "response-2"
+        await bridge._observe_raw_response(event)
+    finally:
+        release.set()
+        while pending := [task for task in bridge.background if not task.done()]:
+            await asyncio.wait_for(asyncio.gather(*pending), timeout=2)
+    notices = [json.loads(message)["params"]["message"] for message in websocket.sent]
+    assert len(notices) == 2
+    assert "turn: $0.003000" in notices[0]
+    assert "(updated)" in notices[1]
+    assert "turn: $0.006000" in notices[1]
+
+
+@pytest.mark.asyncio
+async def test_resumed_cost_notice_drains_rollout_before_display(tmp_path, monkeypatch):
+    monkeypatch.setattr("codex_self_router.proxy.TURN_COST_NOTICE_DELAY", 0)
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    bridge.threads["thread-1"] = ThreadState(ProfileName.SOL, "turn-1", effort="medium")
+    bridge.rollouts["thread-1"] = object()
+
+    async def drain(thread_id):
+        await bridge._observe_raw_response(
+            {
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": "turn-1",
+                    "responseId": "rollout-response",
+                    "usageSource": "codex-rollout",
+                    "usage": {"inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100},
+                }
+            }
+        )
+
+    bridge._drain_rollout = drain
+    await bridge._handle_upstream_payload(
+        json.dumps(
+            {
+                "method": "turn/completed",
+                "params": {
+                    "threadId": "thread-1",
+                    "turn": {"id": "turn-1", "status": "completed"},
+                },
+            }
+        )
+    )
+    await asyncio.gather(*bridge.background)
+    assert "turn: $0.003000" in json.loads(websocket.sent[-1])["params"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_cost_notice_preserves_returns_to_previous_model(tmp_path):
+    websocket = FakeWebSocket()
+    bridge = Bridge(websocket, codex_bin=Path("codex"), report_store=ReportStore(tmp_path))
+    for index, profile in enumerate(
+        (ProfileName.SOL, ProfileName.SOL, ProfileName.LUNA, ProfileName.LUNA, ProfileName.SOL)
+    ):
+        bridge.report.responses.append(
+            UsageRecord(
+                timestamp="2026-10-01T20:00:00+00:00",
+                thread_id="thread-1",
+                turn_id="turn-1",
+                response_id=str(index),
+                profile=profile.value,
+                model=PROFILES[profile].model,
+                effort="medium",
+                usage={"inputTokens": 1000, "cachedInputTokens": 0, "outputTokens": 100},
+            )
+        )
+    await bridge._notify_turn_cost("thread-1", "turn-1")
+    notice = json.loads(websocket.sent[-1])["params"]["message"]
+    assert notice.endswith("gpt-6.1-sol/medium → gpt-6-luna/medium → gpt-6.1-sol/medium.")
 
 
 @pytest.mark.asyncio

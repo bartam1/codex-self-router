@@ -13,6 +13,7 @@ from typing import Any
 from websockets.asyncio.server import Server
 from websockets.asyncio.server import serve as websocket_serve
 
+from .catalog import inspect_model_catalog, probe_app_server
 from .config import (
     DIRECTIVE_ROUTES,
     PROFILES,
@@ -376,8 +377,25 @@ async def async_main(args: argparse.Namespace) -> int:
         display, version = await codex_version(codex_bin)
         print(f"Codex: {display} ({codex_bin})")
         print(f"Config: {loaded_config or 'built-in defaults'}")
-        status = "compatible" if version >= MINIMUM_CODEX_VERSION else "too old"
-        print(f"App-server switching support: {status}")
+        compatible = version >= MINIMUM_CODEX_VERSION
+        if not compatible:
+            print("App-server switching support: too old")
+        else:
+            try:
+                catalog = await probe_app_server(codex_bin)
+                problems = inspect_model_catalog(catalog)
+            except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+                compatible = False
+                print(f"App-server capability check failed: {exc}")
+            else:
+                print("App-server switching support: settings-update API recognized")
+                compatible = not problems
+                if problems:
+                    for problem in problems:
+                        print(f"Model catalog: {problem}")
+                else:
+                    print("Model catalog: all configured models and efforts advertised")
+                print("Inference access: not checked (doctor runs no inference)")
         print(
             "Agent-requested switching: "
             + ("enabled" if get_agent_switching_enabled() else "disabled")
@@ -388,7 +406,7 @@ async def async_main(args: argparse.Namespace) -> int:
             if marker.startswith("#"):
                 continue
             print(f"{marker} {name}: {PROFILES[name].model} / {effort}")
-        return 0 if status == "compatible" else 1
+        return 0 if compatible else 1
     if args.command == "serve":
         return await command_serve(args, codex_bin, store)
     if args.command == "run":

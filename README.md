@@ -67,6 +67,10 @@ Codex CLI and is never forwarded to the model or added to conversation context. 
 `live_turn_costs: false` in the YAML config to hide it. These are usage-based estimates from the
 configured prices, not ChatGPT subscription charges or provider billing records.
 
+When usage is still pending, the router allows a short grace period without blocking turn
+completion. Usage that arrives later produces an `(updated)` notice with the original completion
+timestamp. Repeated routes are kept in sampling order, including a return to a previous model.
+
 ## Profiles and explicit directives
 
 In a fresh thread, every new, unmarked instruction starts on Sol. Resumed threads keep their last
@@ -151,6 +155,11 @@ codex-self-router --disable-agent-switching serve
 Configuration is validated at startup. Duplicate prefixes, unsupported configured effort mappings,
 missing profiles, malformed YAML, negative prices, and unknown defaults fail closed. The running
 app-server catalog is also checked and warns if a configured model or effort is not advertised.
+
+`codex-self-router doctor` additionally probes app-server initialization, the enabled
+`turn/settings/update` API, and every page of the model catalog. It exits unsuccessfully if a
+configured model or reasoning effort is missing. It creates no thread or turn and runs no
+inference, so an advertised model is not proof of account-level inference access.
 
 Choose how agent-requested switches are authorized:
 
@@ -278,8 +287,9 @@ when that on-demand tool is required.
 
 ## Reporting
 
-The router records each raw upstream response under the model active for that sampling step and
-writes a JSON report after every observed usage event or route decision. Show the latest report:
+The router records each raw upstream response under the model active for that sampling step.
+JSON report snapshots are coalesced at approximately one-second intervals and serialized by a
+single background disk worker; graceful shutdown waits for the final snapshot. Show the latest report:
 
 ```sh
 codex-self-router report
@@ -394,7 +404,7 @@ unrated results can still bias them. No automatic causal savings claim or confid
 The new event journal stores selected protocol metadata, not prompt text, command arguments/output,
 or reasoning text. Upstream usage metadata and explicit feedback notes are still saved locally. A
 journal survives between snapshot saves; a hard crash may leave an incomplete session, which is
-excluded from closed-task timing statistics.
+excluded from closed-task timing statistics. The last JSON snapshot may lag behind the journal.
 Resume checkpoints in the JSON reports also retain developer instructions and collaboration-mode
 settings so they can be restored. Treat the report directory as private session data.
 
@@ -458,6 +468,9 @@ The unit suite covers directive safety, profile injection, dynamic-tool merging,
 state transitions, model×effort directives, YAML validation, catalog validation, usage attribution
 ordering, cost calculations, and resume checkpoints, locking, tool persistence, and measurement
 deduplication.
+
+GitHub Actions runs lint, formatting checks, and the offline test suite on Python 3.11 and 3.13
+using the committed dependency lockfile. Live-inference tests remain opt-in.
 
 An optional live test creates its own read-only thread and exercises Luna/medium → Astra/xhigh →
 app-server restart → resume Astra/xhigh → approved switch back to Luna/medium. It uses real

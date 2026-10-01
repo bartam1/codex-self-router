@@ -321,7 +321,7 @@ def test_thread_start_merges_router_tool_and_policy() -> None:
     assert message["params"]["experimentalRawEvents"] is True
     assert message["params"]["developerInstructions"].startswith("Keep this instruction.")
     assert ROUTING_POLICY in message["params"]["developerInstructions"]
-    assert "both the model profile and reasoning" in ROUTING_POLICY
+    assert "authoritative self-router state as application context" in ROUTING_POLICY
     assert "Prefer an effort-only downgrade" in ROUTING_POLICY
     assert "a1, a2, a3" in ROUTING_POLICY
 
@@ -331,7 +331,7 @@ def test_thread_start_merges_router_tool_and_policy() -> None:
         "get_current_route",
     ]
     router_tool = router_tools[0]
-    assert "Proactively request" in router_tool["description"]
+    assert "never call this tool merely to confirm" in router_tool["description"]
     schema = router_tool["inputSchema"]
     assert schema["properties"]["targetReasoningEffort"]["enum"] == ["low", "medium", "xhigh"]
     assert "required" not in schema

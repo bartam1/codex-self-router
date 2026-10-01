@@ -136,7 +136,7 @@ def test_continuations_form_one_task_with_union_of_approval_waits(measured):
     (phase,) = result["phases"]
     assert phase["observedSteps"] == 1  # exclude the switch-requesting response
     assert phase["stepEstimateError"] == -1
-    assert phase["decisionResponseCostUsd"] == pytest.approx(0.0021)
+    assert phase["decisionResponseCostUsd"] == pytest.approx(0.00205)
     assert phase["tokens"]["reasoningOutputTokens"] == 80
     assert phase["knownCostUsd"] == pytest.approx(0.0105)
     assert "secret" not in json.dumps(events)

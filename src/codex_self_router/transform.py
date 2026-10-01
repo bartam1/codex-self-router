@@ -279,9 +279,7 @@ def parse_switch_arguments(
             else current_profile
         )
         effort = (
-            str(raw_effort).strip().lower()
-            if raw_effort is not None
-            else PROFILES[target].effort
+            str(raw_effort).strip().lower() if raw_effort is not None else PROFILES[target].effort
         )
         reason = str(arguments["reason"]).strip() or None if "reason" in arguments else None
     except (TypeError, ValueError) as exc:

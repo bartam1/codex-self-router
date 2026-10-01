@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import os
 import re
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -138,23 +141,25 @@ class SessionReport:
         )
 
     def costs(self) -> dict[str, Any]:
-        known = [
-            item
-            for item in self.responses
-            if record_cost(item, item.profile, self.prices) is not None
-        ]
-        routed = sum(record_cost(item, item.profile, self.prices) or 0 for item in known)
-        all_sol = sum(record_cost(item, ProfileName.SOL, self.prices) or 0 for item in known)
-        all_astra = sum(record_cost(item, ProfileName.ASTRA, self.prices) or 0 for item in known)
+        routed = all_sol = all_astra = 0.0
+        priced = 0
+        for item in self.responses:
+            cost = record_cost(item, item.profile, self.prices)
+            if cost is None:
+                continue
+            priced += 1
+            routed += cost
+            all_sol += record_cost(item, ProfileName.SOL, self.prices) or 0
+            all_astra += record_cost(item, ProfileName.ASTRA, self.prices) or 0
         return {
             "routedApiEquivalentUsd": round(routed, 8),
             "sameObservedUsageAllSolUsd": round(all_sol, 8),
             "sameObservedUsageAllAstraUsd": round(all_astra, 8),
             "estimatedSavingsVsAllSolUsd": round(all_sol - routed, 8),
             "estimatedSavingsVsAllAstraUsd": round(all_astra - routed, 8),
-            "pricedResponses": len(known),
-            "unpricedResponses": len(self.responses) - len(known),
-            "complete": len(known) == len(self.responses),
+            "pricedResponses": priced,
+            "unpricedResponses": len(self.responses) - priced,
+            "complete": priced == len(self.responses),
         }
 
     def to_dict(self) -> dict[str, Any]:
@@ -314,3 +319,56 @@ class ReportStore:
         if not candidates:
             return None
         return self.read(candidates[-1])
+
+
+class ReportWriter:
+    """Coalesce snapshots and serialize disk writes outside the protocol event loop."""
+
+    def __init__(
+        self,
+        store: ReportStore,
+        snapshot: Callable[[], SessionReport],
+        interval: float = 1.0,
+    ) -> None:
+        self.store = store
+        self.snapshot = snapshot
+        self.interval = interval
+        self.dirty = asyncio.Event()
+        self.closing = asyncio.Event()
+        self.lock = asyncio.Lock()
+        self.task: asyncio.Task[None] | None = None
+
+    def start(self) -> None:
+        self.task = asyncio.create_task(self._run(), name="report-writer")
+
+    def request_save(self) -> None:
+        if self.task is not None and self.task.done():
+            self.task.result()  # Surface writer failures on the next protocol operation.
+        self.dirty.set()
+
+    async def flush(self) -> None:
+        async with self.lock:
+            if not self.dirty.is_set():
+                return
+            self.dirty.clear()
+            snapshot = self.snapshot()  # Detached before the worker reads mutable session state.
+            await asyncio.to_thread(self.store.save, snapshot)
+
+    async def _run(self) -> None:
+        while True:
+            await self.dirty.wait()
+            if not self.closing.is_set():
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(self.closing.wait(), timeout=self.interval)
+            await self.flush()
+            if self.closing.is_set() and not self.dirty.is_set():
+                return
+
+    async def close(self) -> None:
+        # Do not cancel an in-flight to_thread write: it must finish before the final snapshot.
+        self.closing.set()
+        self.dirty.set()
+        if self.task is not None:
+            await self.task
+        else:
+            await self.flush()

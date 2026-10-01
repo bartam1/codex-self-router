@@ -9,12 +9,14 @@ import logging
 import time
 import uuid
 from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
 from typing import Any
 
 from websockets.asyncio.server import ServerConnection
 
 from . import __version__
+from .catalog import APP_SERVER_STREAM_LIMIT, inspect_model_catalog, read_model_catalog
 from .config import (
     PROFILES,
     ProfileName,
@@ -32,6 +34,7 @@ from .config import (
 from .measurement import Measurements
 from .report import (
     ReportStore,
+    ReportWriter,
     SessionReport,
     SwitchRecord,
     UsageRecord,
@@ -55,10 +58,8 @@ from .transform import (
 
 LOG = logging.getLogger("codex_self_router")
 
-# App-server speaks newline-delimited JSON, and model/list can exceed asyncio's
-# default 64 KiB StreamReader limit as the model catalog grows.
-APP_SERVER_STREAM_LIMIT = 16 * 1024 * 1024
 STEP_UPDATE_COMPATIBILITY_PREFIX = "the destination changes "
+TURN_COST_NOTICE_DELAY = 0.25
 
 
 def _continuation_tool_output(
@@ -158,6 +159,7 @@ class Bridge:
         self.codex_bin = codex_bin
         self.report_store = report_store or ReportStore()
         self.report = SessionReport(session_id=str(uuid.uuid4()))
+        self.report_writer: ReportWriter | None = None
         self.fixed_profile = fixed_profile
         self.switch_approval = switch_approval or get_switch_approval()
         self.agent_switching_enabled = get_agent_switching_enabled()
@@ -195,7 +197,9 @@ class Bridge:
         self.response_condition = asyncio.Condition()
         self.turn_completion_waiters: dict[tuple[str, str], asyncio.Future[dict[str, Any]]] = {}
         self.automatic_continuation_turns: set[tuple[str, str]] = set()
-        self.cost_notified_turns: set[tuple[str, str]] = set()
+        self.cost_completed_turns: set[tuple[str, str]] = set()
+        self.cost_notice_counts: dict[tuple[str, str], int] = {}
+        self.pending_cost_notices: set[tuple[str, str]] = set()
         self.background: set[asyncio.Task[Any]] = set()
         self.catalog_validation_started = False
         self.closed = False
@@ -216,6 +220,8 @@ class Bridge:
             limit=APP_SERVER_STREAM_LIMIT,
         )
         assert self.process.stdout is not None
+        self.report_writer = ReportWriter(self.report_store, self._snapshot_report)
+        self.report_writer.start()
         stderr_task = asyncio.create_task(self._drain_stderr(), name="app-server-stderr")
         client_read = asyncio.create_task(self.websocket.recv(), name="client-read")
         upstream_read = asyncio.create_task(self.process.stdout.readline(), name="upstream-read")
@@ -270,7 +276,8 @@ class Bridge:
             client_read.cancel()
             upstream_read.cancel()
             stderr_task.cancel()
-            for task in self.background:
+            background = list(self.background)
+            for task in background:
                 task.cancel()
             for future in [*self.internal_requests.values(), *self.client_prompts.values()]:
                 if not future.done():
@@ -278,6 +285,9 @@ class Bridge:
             for future in self.turn_completion_waiters.values():
                 if not future.done():
                     future.cancel()
+            await asyncio.gather(
+                client_read, upstream_read, stderr_task, *background, return_exceptions=True
+            )
             await self._stop_process()
             # The writer flushes on shutdown. Capture its final records before closing the report.
             for thread_id in self.rollouts:
@@ -295,11 +305,21 @@ class Bridge:
                     )
             self.report.ended_at = utc_now()
             self.measurements.close()
-            self._save_report()
-            for lease in self.thread_leases.values():
-                lease.close()
+            try:
+                self._save_report()
+                await self.report_writer.close()
+            finally:
+                for lease in self.thread_leases.values():
+                    lease.close()
 
     def _save_report(self) -> None:
+        if self.report_writer is not None:
+            self.report_writer.request_save()
+        else:
+            # Before run() starts there is no background writer or concurrent session mutation.
+            self.report_store.save(self._snapshot_report())
+
+    def _snapshot_report(self) -> SessionReport:
         self.report.measurements = self.measurements.to_dict()
         for thread_id, snapshot in self.report.thread_states.items():
             turns = [t for t in self.measurements.turns.values() if t["thread_id"] == thread_id]
@@ -315,7 +335,7 @@ class Bridge:
                     )
                 }
             snapshot["updated_at"] = utc_now()
-        self.report_store.save(self.report)
+        return copy.deepcopy(self.report)
 
     def _checkpoint_thread(self, thread_id: str, instructions: str | None = None) -> None:
         self._claim_thread(thread_id)
@@ -566,8 +586,10 @@ class Bridge:
         if method := message.get("method"):
             method = str(method)
         if method is None and request_key is not None:
+            old_sequence = self.measurements.sequence
             self.measurements.resolve_wait(str(request_id))
-            self._save_report()
+            if self.measurements.sequence != old_sequence:
+                self._save_report()
         if method in {"turn/interrupt", "turn/steer", "turn/start"}:
             params = message.get("params", {})
             state = self.threads.get(str(params.get("threadId", "")))
@@ -831,7 +853,14 @@ class Bridge:
             elif directive_lock_released:
                 self._checkpoint_thread(thread_id)
             if self.live_turn_costs:
-                await self._notify_turn_cost(thread_id, turn_id)
+                self.cost_completed_turns.add((thread_id, turn_id))
+                if thread_id in self.rollouts or not any(
+                    record.thread_id == thread_id and record.turn_id == turn_id
+                    for record in self.report.responses
+                ):
+                    self._schedule_turn_cost(thread_id, turn_id)
+                else:
+                    await self._notify_turn_cost(thread_id, turn_id)
 
         if is_route_state_tool_call(message):
             await self._handle_route_state_call(message)
@@ -899,21 +928,55 @@ class Bridge:
             }
         )
 
+    def _schedule_turn_cost(self, thread_id: str, turn_id: str) -> None:
+        key = (thread_id, turn_id)
+        if not thread_id or not turn_id or key in self.pending_cost_notices or self.closed:
+            return
+        self.pending_cost_notices.add(key)
+        self._start_background(self._delayed_turn_cost(thread_id, turn_id), "turn-cost-notice")
+
+    async def _delayed_turn_cost(self, thread_id: str, turn_id: str) -> None:
+        try:
+            await asyncio.sleep(TURN_COST_NOTICE_DELAY)
+            if thread_id in self.rollouts:
+                await self._drain_rollout(thread_id)
+            await self._notify_turn_cost(thread_id, turn_id)
+        finally:
+            self.pending_cost_notices.discard((thread_id, turn_id))
+        # A response can arrive while sending the notice. Do not lose that update just
+        # because its notification attempt saw this task as still pending.
+        count = sum(
+            record.thread_id == thread_id and record.turn_id == turn_id
+            for record in self.report.responses
+        )
+        if self.cost_notice_counts.get((thread_id, turn_id)) != count:
+            self._schedule_turn_cost(thread_id, turn_id)
+
     async def _notify_turn_cost(self, thread_id: str, turn_id: str) -> None:
         key = (thread_id, turn_id)
-        if not thread_id or not turn_id or key in self.cost_notified_turns:
+        if not thread_id or not turn_id:
             return
-        self.cost_notified_turns.add(key)
         records = [
             record
             for record in self.report.responses
             if record.thread_id == thread_id and record.turn_id == turn_id
         ]
+        previous_count = self.cost_notice_counts.get(key)
+        if previous_count == len(records):
+            return
+        updated = " (updated)" if previous_count is not None else ""
+        completed_at = self.measurements.turns.get(key, {}).get("ended_at")
         occurred_at = (
-            max(parse_timestamp(record.timestamp) for record in records)
-            if records
-            else parse_timestamp(utc_now())
-        ).astimezone().isoformat(timespec="seconds")
+            (
+                parse_timestamp(completed_at)
+                if completed_at
+                else max(parse_timestamp(record.timestamp) for record in records)
+                if records
+                else parse_timestamp(utc_now())
+            )
+            .astimezone()
+            .isoformat(timespec="seconds")
+        )
         if not records:
             state = self.threads.get(thread_id)
             route = (
@@ -922,7 +985,7 @@ class Bridge:
                 else ""
             )
             message = (
-                f"Self-router usage · {occurred_at} · unavailable "
+                f"Self-router usage{updated} · {occurred_at} · unavailable "
                 f"(Codex exposed no usage record){route}."
             )
         else:
@@ -931,6 +994,7 @@ class Bridge:
             complete = len(priced) == len(records)
             turn_cost = sum(priced)
             session_costs = self.report.costs()
+
             def token_total(name: str) -> int:
                 values = (
                     record.usage.get(name, 0)
@@ -943,17 +1007,18 @@ class Bridge:
             cached_tokens = token_total("cachedInputTokens")
             output_tokens = token_total("outputTokens")
             reasoning_tokens = token_total("reasoningOutputTokens")
-            routes = list(
-                dict.fromkeys(
+            routes = [
+                route
+                for route, _ in groupby(
                     f"{record.model or PROFILES[ProfileName(record.profile)].model}/"
                     f"{record.effort or 'unknown'}"
                     for record in records
                     if record.model or record.profile
                 )
-            )
+            ]
             qualifier = "" if complete else "known "
             message = (
-                f"Self-router API-equivalent usage · {occurred_at} · "
+                f"Self-router API-equivalent usage{updated} · {occurred_at} · "
                 f"turn: {qualifier}${turn_cost:.6f} · "
                 f"session: ${session_costs['routedApiEquivalentUsd']:.6f} known · "
                 f"{input_tokens:,} in ({cached_tokens:,} cached) · "
@@ -970,6 +1035,7 @@ class Bridge:
                 "params": {"threadId": thread_id, "message": message},
             }
         )
+        self.cost_notice_counts[key] = len(records)
 
     @staticmethod
     def _clear_temporary_route(state: ThreadState) -> None:
@@ -1089,11 +1155,7 @@ class Bridge:
 
     async def _validate_model_catalog(self) -> None:
         try:
-            response = await self._internal_request(
-                "model/list", {"limit": 100, "includeHidden": True}
-            )
-            if "error" in response:
-                raise RuntimeError(response["error"].get("message", "model/list failed"))
+            response = await read_model_catalog(self._internal_request)
             problems = inspect_model_catalog(response)
         except Exception as exc:
             problems = [f"could not validate model catalog: {exc}"]
@@ -1430,6 +1492,8 @@ class Bridge:
         async with self.response_condition:
             self.response_sequence[key] = self.response_sequence.get(key, 0) + 1
             self.response_condition.notify_all()
+        if self.live_turn_costs and key in self.cost_completed_turns:
+            self._schedule_turn_cost(thread_id, turn_id)
 
     async def _handle_switch_call(self, message: dict[str, Any]) -> None:
         request_id = message.get("id")
@@ -2025,26 +2089,3 @@ class Bridge:
         except TimeoutError:
             self.process.kill()
             await self.process.wait()
-
-
-def inspect_model_catalog(response: dict[str, Any]) -> list[str]:
-    """Return validation problems for the configured profile catalog."""
-
-    entries = response.get("result", {}).get("data", [])
-    by_model = {item.get("model") or item.get("id"): item for item in entries}
-    problems: list[str] = []
-    for profile in PROFILES.values():
-        item = by_model.get(profile.model)
-        if item is None:
-            problems.append(f"model unavailable: {profile.model}")
-            continue
-        efforts = item.get("supportedReasoningEfforts") or []
-        effort_names = {
-            effort.get("reasoningEffort") if isinstance(effort, dict) else effort
-            for effort in efforts
-        }
-        if effort_names:
-            for effort in profile.allowed_efforts:
-                if effort not in effort_names:
-                    problems.append(f"{profile.model} does not advertise effort {effort}")
-    return problems
