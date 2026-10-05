@@ -253,6 +253,11 @@ permissions of the process you start.
 codex-self-router run -- resume THREAD_ID
 ```
 
+Running `codex-self-router run -- resume` opens the picker filtered to the current folder.
+Use `resume --all` to show sessions across folders, or `--cd /path/to/repo resume` to choose
+another folder. The router passes the terminal's folder explicitly to remote Codex unless you
+supply your own `--cd` or `-C` setting. This also applies to the fork picker and `resume --last`.
+
 Version 0.4 supports explicit resume of durable local threads created through the router. It
 restores the last confirmed profile and reasoning effort, restores routing instructions, and
 verifies that Codex saved the routing tool. Explicit overrides and route directives still work.

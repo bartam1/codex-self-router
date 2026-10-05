@@ -240,6 +240,13 @@ async def command_run(args: argparse.Namespace, codex_bin: Path, store: ReportSt
     codex_args = list(args.codex_args)
     if codex_args and codex_args[0] == "--":
         codex_args.pop(0)
+    # Remote Codex cannot infer that its filesystem shares this terminal's cwd.
+    # An explicit cwd enables normal folder filtering in the resume/fork picker.
+    if not any(
+        arg in {"--cd", "-C"} or arg.startswith("--cd=") or arg.startswith("-C")
+        for arg in codex_args
+    ):
+        codex_args = ["--cd", str(Path.cwd()), *codex_args]
     print(f"routing {display} through {remote}", file=sys.stderr)
     process = await asyncio.create_subprocess_exec(str(codex_bin), "--remote", remote, *codex_args)
     try:
